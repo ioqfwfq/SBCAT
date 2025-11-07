@@ -519,6 +519,70 @@ def pac_mvl(phase, amp):
     return np.abs(np.sum(norm_amp * np.exp(1j * phase)) / np.sum(norm_amp))
 
 
+def pac_tort_mi(phase, amp, n_bins=18):
+    """Tort's Modulation Index using Kullback-Leibler divergence.
+
+    Measures how much the amplitude distribution across phase bins deviates
+    from uniform distribution. Range: 0 (no modulation) to 1 (perfect modulation).
+
+    Parameters
+    ----------
+    phase : array_like
+        Phase values in radians [-π, π]
+    amp : array_like
+        Amplitude envelope values
+    n_bins : int, default=18
+        Number of phase bins (typically 18 for 20-degree bins)
+
+    Returns
+    -------
+    float
+        Modulation Index value (0 to 1)
+
+    Reference
+    ---------
+    Tort et al. (2010) J Neurophysiol 104(2):1195-1210
+    """
+    phase = _to_numpy(phase)
+    amp = _to_numpy(amp)
+    if phase.size == 0 or amp.size == 0 or phase.size != amp.size:
+        return np.nan
+    mask = ~np.isnan(phase) & ~np.isnan(amp)
+    if not np.any(mask):
+        return np.nan
+    phase = phase[mask]
+    amp = amp[mask]
+
+    # Bin phases into n_bins
+    phase_bins = np.linspace(-np.pi, np.pi, n_bins + 1)
+    bin_indices = np.digitize(phase, phase_bins) - 1
+    bin_indices = np.clip(bin_indices, 0, n_bins - 1)
+
+    # Compute mean amplitude in each bin
+    mean_amp_per_bin = np.zeros(n_bins)
+    for i in range(n_bins):
+        bin_mask = bin_indices == i
+        if np.any(bin_mask):
+            mean_amp_per_bin[i] = np.mean(amp[bin_mask])
+
+    # Normalize to create probability distribution
+    if np.sum(mean_amp_per_bin) == 0:
+        return np.nan
+    p = mean_amp_per_bin / np.sum(mean_amp_per_bin)
+
+    # Uniform distribution
+    uniform = np.ones(n_bins) / n_bins
+
+    # KL divergence (avoid log(0) by adding small epsilon)
+    epsilon = 1e-10
+    kl_div = np.sum(p * np.log((p + epsilon) / (uniform + epsilon)))
+
+    # Normalize by maximum possible KL divergence
+    mi = kl_div / np.log(n_bins)
+
+    return float(mi)
+
+
 def pac_trialshuffle_zscore(values_obs, values_surr):
     """Z-score an observed PAC value relative to trial-shuffled surrogates."""
     if values_obs is None:
@@ -988,7 +1052,7 @@ def compute_irpac(
                 phase_segment = phase_segment[:length]
                 amp_segment = amp_segment[:length]
                 trial_segments[cond].append((phase_segment, amp_segment))
-                trial_values[cond].append(pac_mvl(phase_segment, amp_segment))
+                trial_values[cond].append(pac_tort_mi(phase_segment, amp_segment))
 
         # Require data for all conditions
         counts = {cond: len([v for v in vals if not np.isnan(v)]) for cond, vals in trial_values.items()}
@@ -1007,7 +1071,7 @@ def compute_irpac(
                 continue
             phase_concat = np.concatenate([seg[0] for seg in segments])
             amp_concat = np.concatenate([seg[1] for seg in segments])
-            obs = pac_mvl(phase_concat, amp_concat)  # MVL-MI from concatenated trials
+            obs = pac_tort_mi(phase_concat, amp_concat)  # Tort's MI from concatenated trials
 
             # Trial-shuffle surrogates
             surrogate_values = []
@@ -1027,7 +1091,7 @@ def compute_irpac(
                         shuffled_amp.append(amp_seg[:length])
                     if shuffled_phase and shuffled_amp:
                         surrogate_values.append(
-                            pac_mvl(np.concatenate(shuffled_phase), np.concatenate(shuffled_amp))
+                            pac_tort_mi(np.concatenate(shuffled_phase), np.concatenate(shuffled_amp))
                         )
 
             z_value = pac_trialshuffle_zscore(obs, surrogate_values)
@@ -1050,7 +1114,7 @@ def compute_irpac(
                     if len(phase_shifted) == 0 or len(amp_shifted) == 0:
                         lag_curve.append(np.nan)
                     else:
-                        lag_curve.append(pac_mvl(phase_shifted, amp_shifted))
+                        lag_curve.append(pac_tort_mi(phase_shifted, amp_shifted))
                 lag_curve = np.array(lag_curve)
                 if exclude_lag_s and lag_grid_s is not None:
                     excl_low, excl_high = sorted(exclude_lag_s)

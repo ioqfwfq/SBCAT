@@ -896,7 +896,7 @@ def _empty_pac_results(
         "epoch_end_s",
         "n_trials",
         "min_trial_count",
-        "mean_pac",
+        "raw_pac",
         "z_pac_theta_gamma",
         *lag_column_names,
         "p_pac_theta_gamma",
@@ -1031,7 +1031,6 @@ def compute_irpac(
             amp_signal = amp_signal[:n]
 
         trial_segments = {cond: [] for cond in conditions}
-        trial_values = {cond: [] for cond in conditions}
 
         for cond in conditions:
             cond_trials = trials_df[trials_df["condition_label"] == cond]
@@ -1055,15 +1054,12 @@ def compute_irpac(
                 phase_segment = phase_segment[:length]
                 amp_segment = amp_segment[:length]
                 trial_segments[cond].append((phase_segment, amp_segment))
-                trial_values[cond].append(pac_tort_mi(phase_segment, amp_segment))
 
         # Require data for all conditions
-        counts = {cond: len([v for v in vals if not np.isnan(v)]) for cond, vals in trial_values.items()}
+        counts = {cond: len(segments) for cond, segments in trial_segments.items()}
         if any(count == 0 for count in counts.values()):
             continue
 
-        # Compute mean PAC per condition from trial-level values
-        mean_pac_vals = {cond: np.nanmean(vals) for cond, vals in trial_values.items()}
         min_count = min(counts.values())
         if min_count < min_trials:
             continue
@@ -1151,7 +1147,7 @@ def compute_irpac(
                     "epoch_end_s": epoch_end,
                     "n_trials": len(segments),
                     "min_trial_count": min_count,
-                    "mean_pac": mean_pac_vals.get(cond, np.nan),
+                    "raw_pac": obs,
                     "z_pac_theta_gamma": z_value,
                     **lag_curve_columns,
                     "p_pac_theta_gamma": p_value,

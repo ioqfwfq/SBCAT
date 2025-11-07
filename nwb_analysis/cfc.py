@@ -1096,7 +1096,7 @@ def compute_irpac(
 
             z_value = pac_trialshuffle_zscore(obs, surrogate_values)
             p_value = pac_surrogate_pvalue(obs, surrogate_values, tail="greater")
-            is_significant = bool(not np.isnan(p_value) and p_value <= significance_alpha)
+            is_significant = bool(not np.isnan(z_value) and z_value >= 1.64)
 
             lag_curve = None
             if lag_samples is not None:

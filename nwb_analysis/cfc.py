@@ -584,7 +584,11 @@ def pac_tort_mi(phase, amp, n_bins=18):
 
 
 def pac_trialshuffle_zscore(values_obs, values_surr):
-    """Z-score an observed PAC value relative to trial-shuffled surrogates."""
+    """Z-score an observed PAC value relative to trial-shuffled surrogates.
+
+    Fits a normal distribution to the surrogate values via maximum likelihood
+    estimation to obtain the mean and standard deviation of the null distribution.
+    """
     if values_obs is None:
         return np.nan
     obs = float(values_obs)
@@ -596,8 +600,7 @@ def pac_trialshuffle_zscore(values_obs, values_surr):
     surr = surr[~np.isnan(surr)]
     if surr.size == 0:
         return np.nan
-    mu = surr.mean()
-    sigma = surr.std(ddof=0)
+    mu, sigma = norm.fit(surr)  # Fit normal distribution via MLE
     if sigma == 0:
         return np.nan
     return (obs - mu) / sigma

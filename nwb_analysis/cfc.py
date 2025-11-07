@@ -166,8 +166,10 @@ def _bca_ci(
     return float(lower), float(upper)
 
 
-def _build_trial_table(raw_trials: pd.DataFrame, *, conditions: Sequence[str], use_only_correct: bool) -> pd.DataFrame:
+def _build_trial_table(raw_trials: pd.DataFrame, *, conditions: Sequence[str], use_only_correct: bool, epoch_label: str = "maintenance") -> pd.DataFrame:
     """Return standardized trial metadata table."""
+    from .config import EVENT_DEFINITIONS
+    
     trials = raw_trials.copy()
     trials = trials.reset_index().rename(columns={"index": "trial_id"})
 
@@ -183,8 +185,17 @@ def _build_trial_table(raw_trials: pd.DataFrame, *, conditions: Sequence[str], u
     else:
         trials["rt"] = trials.get("stop_time", np.nan) - trials.get("start_time", np.nan)
 
-    # Maintenance onset
-    trials["maint_onset_time"] = trials.get("timestamps_Maintenance", np.nan)
+    # Epoch onset time - configurable based on epoch_label
+    # Default to maintenance for backward compatibility
+    if epoch_label in EVENT_DEFINITIONS:
+        timestamp_col = EVENT_DEFINITIONS[epoch_label]["timestamp"]
+        trials["epoch_onset_time"] = trials.get(timestamp_col, np.nan)
+        # Also keep maint_onset_time for backward compatibility
+        trials["maint_onset_time"] = trials.get("timestamps_Maintenance", np.nan)
+    else:
+        # Fallback to maintenance if epoch_label not found
+        trials["epoch_onset_time"] = trials.get("timestamps_Maintenance", np.nan)
+        trials["maint_onset_time"] = trials["epoch_onset_time"]
 
     # Accuracy flag
     if "response_accuracy" in trials.columns:
@@ -199,7 +210,7 @@ def _build_trial_table(raw_trials: pd.DataFrame, *, conditions: Sequence[str], u
     if conditions:
         trials = trials[trials["condition_label"].isin(conditions)]
 
-    cols = ["trial_id", "condition_label", "rt", "maint_onset_time", "is_correct"]
+    cols = ["trial_id", "condition_label", "rt", "epoch_onset_time", "maint_onset_time", "is_correct"]
     keep_cols = [col for col in cols if col in trials.columns]
     trials = trials[keep_cols + [c for c in trials.columns if c not in keep_cols]]
     return trials.reset_index(drop=True)
@@ -311,9 +322,17 @@ def prepare_session_structures(
     save_cache: bool = False,
     conditions: Sequence[str] = ("L1", "L3"),
     use_only_correct: bool = True,
+    epoch_label: str = "maintenance",
 ) -> dict:
     """
     Adapter that returns canonical data objects expected by downstream analyses.
+
+    Parameters
+    ----------
+    epoch_label : str, default "maintenance"
+        Epoch type to use for analysis. Must be one of: 'encoding1', 'encoding2', 
+        'encoding3', 'maintenance', 'probe'. Determines which timestamp column 
+        is used as the epoch onset reference.
 
     Returns:
         dict with keys:
@@ -338,7 +357,7 @@ def prepare_session_structures(
     raw_trials = nwb_data.get("trials")
     if raw_trials is None:
         raise ValueError("Trial table not found in NWB session.")
-    trial_table = _build_trial_table(raw_trials, conditions=conditions, use_only_correct=use_only_correct)
+    trial_table = _build_trial_table(raw_trials, conditions=conditions, use_only_correct=use_only_correct, epoch_label=epoch_label)
 
     spike_times_by_unit, unit_meta = _extract_spike_structures(nwbfile)
     lfp_by_channel, channel_meta, lfp_fs, lfp_start_time = _extract_lfp_structures(nwb_data)
@@ -735,20 +754,23 @@ def compute_spike_field_coherence(
                 continue
 
             for trial in cond_trials.itertuples():
-                maint_onset = getattr(trial, "maint_onset_time", np.nan)
-                if np.isnan(maint_onset):
+                # Prefer epoch_onset_time, fallback to maint_onset_time for backward compatibility
+                epoch_onset = getattr(trial, "epoch_onset_time", None)
+                if epoch_onset is None:
+                    epoch_onset = getattr(trial, "maint_onset_time", np.nan)
+                if np.isnan(epoch_onset):
                     continue
 
-                analyze_start = maint_onset + epoch_analyze[0]
-                analyze_end = maint_onset + epoch_analyze[1]
+                analyze_start = epoch_onset + epoch_analyze[0]
+                analyze_end = epoch_onset + epoch_analyze[1]
                 spikes = _to_numpy(spike_times_by_unit[pair.unit_id])
                 spike_mask = (spikes >= analyze_start) & (spikes <= analyze_end)
                 spikes_in_window = spikes[spike_mask]
                 if spikes_in_window.size == 0:
                     continue
 
-                extract_start = maint_onset + epoch_extract[0]
-                extract_end = maint_onset + epoch_extract[1]
+                extract_start = epoch_onset + epoch_extract[0]
+                extract_end = epoch_onset + epoch_extract[1]
                 start_idx = int(max(0, np.floor((extract_start - lfp_start_time) * lfp_fs)))
                 end_idx = int(min(len(theta_phase[pair.chan_id]), np.ceil((extract_end - lfp_start_time) * lfp_fs)))
                 if end_idx <= start_idx:
@@ -1495,13 +1517,16 @@ def compute_vmPFC_theta_phase(
 
     for trial in trials_df.itertuples():
         trial_id = getattr(trial, "id", getattr(trial, "trial_id", trial.Index))
-        maint_onset = getattr(trial, "maint_onset_time", np.nan)
-        if np.isnan(maint_onset):
+        # Prefer epoch_onset_time, fallback to maint_onset_time for backward compatibility
+        epoch_onset = getattr(trial, "epoch_onset_time", None)
+        if epoch_onset is None:
+            epoch_onset = getattr(trial, "maint_onset_time", np.nan)
+        if np.isnan(epoch_onset):
             continue
 
         # Calculate trial epoch with padding
-        epoch_start = maint_onset + epoch_analyze[0]
-        epoch_end = maint_onset + epoch_analyze[1]
+        epoch_start = epoch_onset + epoch_analyze[0]
+        epoch_end = epoch_onset + epoch_analyze[1]
         padded_start = epoch_start - trial_pad_sec
         padded_end = epoch_end + trial_pad_sec
 
@@ -1602,13 +1627,16 @@ def compute_hipp_gamma_envelope(
 
     for trial in trials_df.itertuples():
         trial_id = getattr(trial, "id", getattr(trial, "trial_id", trial.Index))
-        maint_onset = getattr(trial, "maint_onset_time", np.nan)
-        if np.isnan(maint_onset):
+        # Prefer epoch_onset_time, fallback to maint_onset_time for backward compatibility
+        epoch_onset = getattr(trial, "epoch_onset_time", None)
+        if epoch_onset is None:
+            epoch_onset = getattr(trial, "maint_onset_time", np.nan)
+        if np.isnan(epoch_onset):
             continue
 
         # Calculate trial epoch with padding
-        epoch_start = maint_onset + epoch_analyze[0]
-        epoch_end = maint_onset + epoch_analyze[1]
+        epoch_start = epoch_onset + epoch_analyze[0]
+        epoch_end = epoch_onset + epoch_analyze[1]
         padded_start = epoch_start - trial_pad_sec
         padded_end = epoch_end + trial_pad_sec
 

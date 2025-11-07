@@ -936,10 +936,9 @@ def compute_irpac(
     *,
     pair_table: pd.DataFrame,
     trial_table: pd.DataFrame,
-    theta_phase: Mapping[int, np.ndarray],
-    gamma_envelope: Mapping[int, np.ndarray],
+    theta_phase: Mapping[int, list],
+    gamma_envelope: Mapping[int, list],
     lfp_fs: float,
-    lfp_start_time: float,
     epoch_analyze: Tuple[float, float],
     conditions: Sequence[str],
     min_trials: int,
@@ -956,12 +955,19 @@ def compute_irpac(
 ) -> pd.DataFrame:
     """Compute hippocampal gamma ↔ vmPFC theta ir-PAC per pair/condition.
 
+    Parameters
+    ----------
+    theta_phase : Mapping[int, list]
+        Per-trial phase segments. Format: {chan_id: [(trial_id, phase_segment), ...]}
+    gamma_envelope : Mapping[int, list]
+        Per-trial amplitude segments. Format: {chan_id: [(trial_id, amp_segment), ...]}
+
     Returns
     -------
     pd.DataFrame
         Flat table with one row per (pair_id, condition) containing:
         pair_id, unit_id, hipp_chan_id, vm_chan_id, condition, trial counts,
-        equalized PAC, z/p-values, significance flag, and optional lag-curve
+        raw PAC, z/p-values, significance flag, and optional lag-curve
         samples flattened into scalar columns named lag_curve_<idx>.
         All metadata (phase_band, amp_band, epoch) is included as columns.
         No nested structures or attrs.
@@ -1023,12 +1029,14 @@ def compute_irpac(
         if vm_chan not in theta_phase or hipp_chan not in gamma_envelope:
             continue
 
-        phase_signal = theta_phase[vm_chan]
-        amp_signal = gamma_envelope[hipp_chan]
-        if len(phase_signal) != len(amp_signal):
-            n = min(len(phase_signal), len(amp_signal))
-            phase_signal = phase_signal[:n]
-            amp_signal = amp_signal[:n]
+        # theta_phase and gamma_envelope now contain per-trial segments
+        # Format: {chan_id: [(trial_id, segment), ...]}
+        phase_trials = theta_phase[vm_chan]
+        amp_trials = gamma_envelope[hipp_chan]
+
+        # Build lookup dictionaries: trial_id -> segment
+        phase_by_trial = {trial_id: seg for trial_id, seg in phase_trials}
+        amp_by_trial = {trial_id: seg for trial_id, seg in amp_trials}
 
         trial_segments = {cond: [] for cond in conditions}
 
@@ -1037,17 +1045,16 @@ def compute_irpac(
             if cond_trials.empty:
                 continue
             for trial in cond_trials.itertuples():
-                maint_onset = getattr(trial, "maint_onset_time", np.nan)
-                if np.isnan(maint_onset):
+                trial_id = getattr(trial, "id", getattr(trial, "trial_id", trial.Index))
+
+                # Look up pre-computed segments by trial_id
+                if trial_id not in phase_by_trial or trial_id not in amp_by_trial:
                     continue
-                analyze_start = maint_onset + epoch_analyze[0]
-                analyze_end = maint_onset + epoch_analyze[1]
-                start_idx = int(max(0, np.floor((analyze_start - lfp_start_time) * lfp_fs)))
-                end_idx = int(min(len(phase_signal), np.ceil((analyze_end - lfp_start_time) * lfp_fs)))
-                if end_idx <= start_idx:
-                    continue
-                phase_segment = phase_signal[start_idx:end_idx]
-                amp_segment = amp_signal[start_idx:end_idx]
+
+                phase_segment = phase_by_trial[trial_id]
+                amp_segment = amp_by_trial[trial_id]
+
+                # Ensure segments have matching lengths
                 length = min(len(phase_segment), len(amp_segment))
                 if length == 0:
                     continue
@@ -1410,25 +1417,45 @@ def compute_vmPFC_theta_phase(
     *,
     lfp_by_channel: Mapping[int, np.ndarray],
     channel_meta: pd.DataFrame,
+    trial_table: pd.DataFrame,
     sampling_rate: float,
+    lfp_start_time: float,
+    epoch_analyze: Tuple[float, float],
     theta_band: Tuple[float, float],
     car_mode: str | None = "hemisphere",
-    hilbert_pad_sec: float = 1.0,
+    trial_pad_sec: float = 0.5,
     filter_order: int = 4,
     exclude_bad: bool = True,
     bad_flag_column: str = "bad",
     max_peak_to_peak: float | None = None,
-) -> Dict[int, np.ndarray]:
+) -> Dict[int, list]:
     """
-    Compute theta-band phase traces for vmPFC channels with optional CAR.
+    Compute theta-band phase traces for vmPFC channels with per-trial processing.
+
+    Each trial epoch is extracted with padding, filtered, Hilbert-transformed,
+    then trimmed to remove edge artifacts. Returns per-trial segments organized
+    by channel.
+
+    Parameters
+    ----------
+    trial_pad_sec : float, default=0.5
+        Padding in seconds to add before and after each trial epoch before
+        filtering/Hilbert transform. Trimmed after processing to remove edge artifacts.
+
+    Returns
+    -------
+    Dict[int, list]
+        Mapping of chan_id -> list of (trial_id, phase_segment) tuples
     """
     df = _as_dataframe(channel_meta)
+    trials_df = _as_dataframe(trial_table)
     areas = df["area"].fillna("") if "area" in df.columns else pd.Series("", index=df.index)
     mask = areas.str.lower().str.contains("vmpfc")
     vm_df = df[mask].copy()
     if vm_df.empty:
         return {}
 
+    # Load and validate signals
     signals = {}
     valid_chan_ids = []
     for row in vm_df.itertuples():
@@ -1447,6 +1474,7 @@ def compute_vmPFC_theta_phase(
     if vm_df.empty:
         return {}
 
+    # Apply CAR to full continuous signals first
     if car_mode in {"region", "hemisphere"}:
         if car_mode == "region":
             group_key = vm_df["area"].fillna("vmPFC")
@@ -1461,14 +1489,51 @@ def compute_vmPFC_theta_phase(
             for cid in group_ids:
                 signals[cid] = signals[cid] - group_mean
 
-    pad_samples = int(hilbert_pad_sec * sampling_rate)
-    phase_dict = {}
-    for chan_id, signal in signals.items():
-        padded, valid_slice = _pad_signal(signal, pad_samples)
-        filtered = bandpass_filtfilt(padded, sampling_rate, theta_band, order=filter_order)
-        analytic = hilbert(filtered)
-        phase = np.angle(analytic[valid_slice]) if pad_samples > 0 else np.angle(analytic)
-        phase_dict[chan_id] = phase
+    # Per-trial processing: segment → pad → filter → Hilbert → trim
+    phase_dict = {chan_id: [] for chan_id in signals.keys()}
+    pad_samples = int(trial_pad_sec * sampling_rate)
+
+    for trial in trials_df.itertuples():
+        trial_id = getattr(trial, "id", getattr(trial, "trial_id", trial.Index))
+        maint_onset = getattr(trial, "maint_onset_time", np.nan)
+        if np.isnan(maint_onset):
+            continue
+
+        # Calculate trial epoch with padding
+        epoch_start = maint_onset + epoch_analyze[0]
+        epoch_end = maint_onset + epoch_analyze[1]
+        padded_start = epoch_start - trial_pad_sec
+        padded_end = epoch_end + trial_pad_sec
+
+        # Convert to sample indices
+        start_idx = int(max(0, np.floor((padded_start - lfp_start_time) * sampling_rate)))
+        end_idx = int(np.ceil((padded_end - lfp_start_time) * sampling_rate))
+
+        for chan_id, signal in signals.items():
+            if end_idx > len(signal):
+                end_idx = len(signal)
+            if end_idx <= start_idx:
+                continue
+
+            # Extract padded segment
+            trial_segment = signal[start_idx:end_idx]
+            if len(trial_segment) == 0:
+                continue
+
+            # Filter and Hilbert transform
+            filtered = bandpass_filtfilt(trial_segment, sampling_rate, theta_band, order=filter_order)
+            analytic = hilbert(filtered)
+            phase = np.angle(analytic)
+
+            # Trim padding from both ends
+            trim_samples = pad_samples
+            if len(phase) <= 2 * trim_samples:
+                # If segment is too short after padding, skip
+                continue
+            phase_trimmed = phase[trim_samples:-trim_samples]
+
+            phase_dict[chan_id].append((trial_id, phase_trimmed))
+
     return phase_dict
 
 
@@ -1476,24 +1541,46 @@ def compute_hipp_gamma_envelope(
     *,
     lfp_by_channel: Mapping[int, np.ndarray],
     channel_meta: pd.DataFrame,
+    trial_table: pd.DataFrame,
     sampling_rate: float,
+    lfp_start_time: float,
+    epoch_analyze: Tuple[float, float],
     gamma_band: Tuple[float, float],
-    hilbert_pad_sec: float = 1.0,
+    trial_pad_sec: float = 0.5,
     filter_order: int = 4,
     exclude_bad: bool = True,
     bad_flag_column: str = "bad",
     max_peak_to_peak: float | None = None,
-) -> Dict[int, np.ndarray]:
-    """Compute hippocampal gamma-band amplitude envelopes."""
+) -> Dict[int, list]:
+    """
+    Compute hippocampal gamma-band amplitude envelopes with per-trial processing.
+
+    Each trial epoch is extracted with padding, filtered, Hilbert-transformed,
+    then trimmed to remove edge artifacts. Returns per-trial segments organized
+    by channel.
+
+    Parameters
+    ----------
+    trial_pad_sec : float, default=0.5
+        Padding in seconds to add before and after each trial epoch before
+        filtering/Hilbert transform. Trimmed after processing to remove edge artifacts.
+
+    Returns
+    -------
+    Dict[int, list]
+        Mapping of chan_id -> list of (trial_id, amplitude_segment) tuples
+    """
     df = _as_dataframe(channel_meta)
+    trials_df = _as_dataframe(trial_table)
     areas = df["area"].fillna("")
     mask = areas.str.lower().str.contains("hipp")
     hipp_df = df[mask].copy()
     if hipp_df.empty:
         return {}
 
-    pad_samples = int(hilbert_pad_sec * sampling_rate)
-    amp_dict = {}
+    # Load and validate signals
+    signals = {}
+    valid_chan_ids = []
     for row in hipp_df.itertuples():
         if exclude_bad and bad_flag_column in hipp_df.columns:
             if bool(getattr(row, bad_flag_column, False)):
@@ -1503,9 +1590,55 @@ def compute_hipp_gamma_envelope(
             continue
         if max_peak_to_peak is not None and np.ptp(signal) > max_peak_to_peak:
             continue
-        padded, valid_slice = _pad_signal(signal, pad_samples)
-        filtered = bandpass_filtfilt(padded, sampling_rate, gamma_band, order=filter_order)
-        analytic = hilbert(filtered)
-        amp = np.abs(analytic[valid_slice]) if pad_samples > 0 else np.abs(analytic)
-        amp_dict[row.chan_id] = amp
+        signals[row.chan_id] = signal
+        valid_chan_ids.append(row.chan_id)
+
+    if not signals:
+        return {}
+
+    # Per-trial processing: segment → pad → filter → Hilbert → trim
+    amp_dict = {chan_id: [] for chan_id in signals.keys()}
+    pad_samples = int(trial_pad_sec * sampling_rate)
+
+    for trial in trials_df.itertuples():
+        trial_id = getattr(trial, "id", getattr(trial, "trial_id", trial.Index))
+        maint_onset = getattr(trial, "maint_onset_time", np.nan)
+        if np.isnan(maint_onset):
+            continue
+
+        # Calculate trial epoch with padding
+        epoch_start = maint_onset + epoch_analyze[0]
+        epoch_end = maint_onset + epoch_analyze[1]
+        padded_start = epoch_start - trial_pad_sec
+        padded_end = epoch_end + trial_pad_sec
+
+        # Convert to sample indices
+        start_idx = int(max(0, np.floor((padded_start - lfp_start_time) * sampling_rate)))
+        end_idx = int(np.ceil((padded_end - lfp_start_time) * sampling_rate))
+
+        for chan_id, signal in signals.items():
+            if end_idx > len(signal):
+                end_idx = len(signal)
+            if end_idx <= start_idx:
+                continue
+
+            # Extract padded segment
+            trial_segment = signal[start_idx:end_idx]
+            if len(trial_segment) == 0:
+                continue
+
+            # Filter and Hilbert transform
+            filtered = bandpass_filtfilt(trial_segment, sampling_rate, gamma_band, order=filter_order)
+            analytic = hilbert(filtered)
+            amp = np.abs(analytic)
+
+            # Trim padding from both ends
+            trim_samples = pad_samples
+            if len(amp) <= 2 * trim_samples:
+                # If segment is too short after padding, skip
+                continue
+            amp_trimmed = amp[trim_samples:-trim_samples]
+
+            amp_dict[chan_id].append((trial_id, amp_trimmed))
+
     return amp_dict

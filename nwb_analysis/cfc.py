@@ -501,41 +501,6 @@ def equalize_trial_counts(values_by_cond, repeats=200, rng=None):
     return averaged, min_trials
 
 
-def _pac_from_segment_lists(phase_segments, amp_segments):
-    """Concatenate phase/amp trial segments (with length matching) and compute PAC MVL."""
-    phase_concat = []
-    amp_concat = []
-    for phase_seg, amp_seg in zip(phase_segments, amp_segments):
-        phase_arr = _to_numpy(phase_seg)
-        amp_arr = _to_numpy(amp_seg)
-        length = min(phase_arr.size, amp_arr.size)
-        if length == 0:
-            continue
-        phase_concat.append(phase_arr[:length])
-        amp_concat.append(amp_arr[:length])
-    if not phase_concat:
-        return np.nan
-    phase_full = np.concatenate(phase_concat)
-    amp_full = np.concatenate(amp_concat)
-    return pac_mvl(phase_full, amp_full)
-
-
-def _random_derangement(length: int, rng: np.random.Generator) -> np.ndarray | None:
-    """Return a permutation with no fixed points (derangement)."""
-    if length < 2:
-        return None
-    perm = rng.permutation(length)
-    indices = np.arange(length)
-    for idx in range(length):
-        if perm[idx] == idx:
-            swap_idx = (idx + 1) % length
-            perm[idx], perm[swap_idx] = perm[swap_idx], perm[idx]
-    if np.any(perm == indices):
-        # Fallback to a simple cyclic shift to guarantee a derangement.
-        perm = (indices + 1) % length
-    return perm
-
-
 def pac_mvl(phase, amp):
     """Amplitude-weighted MVL (amp normalized to mean=1)."""
     phase = _to_numpy(phase)
@@ -841,7 +806,7 @@ def _empty_pac_results(
     epoch_label: str | None = None,
     epoch_window: Tuple[float, float] | None = None,
 ) -> pd.DataFrame:
-    """Return an empty ir-PAC results table with metadata attrs."""
+    """Return an empty ir-PAC results DataFrame (flat, no nested attrs)."""
     lag_grid_tuple = _seq_to_tuple(lag_grid_s)
     lag_column_names = []
     if lag_grid_tuple is not None:
@@ -871,20 +836,7 @@ def _empty_pac_results(
         "is_pac_significant",
         "alpha",
     ]
-    df = pd.DataFrame(columns=columns)
-    df.attrs["per_pair"] = {}
-    df.attrs["per_condition"] = {cond: {} for cond in conditions}
-    df.attrs["lag_grid_s"] = lag_grid_tuple
-    df.attrs["lag_curve_columns"] = {name: lag for name, lag in zip(lag_column_names, lag_grid_tuple or [])}
-    df.attrs["analysis_meta"] = {
-        "phase_band": phase_band,
-        "amp_band": amp_band,
-        "phase_band_label": phase_band_label,
-        "amp_band_label": amp_band_label,
-        "epoch_label": epoch_label,
-        "epoch_window": epoch_window,
-    }
-    return df
+    return pd.DataFrame(columns=columns)
 
 
 def compute_irpac(
@@ -909,23 +861,18 @@ def compute_irpac(
     phase_band_label: str | None = None,
     amp_band_label: str | None = None,
     epoch_label: str | None = None,
-) -> dict:
+) -> pd.DataFrame:
     """Compute hippocampal gamma ↔ vmPFC theta ir-PAC per pair/condition.
 
     Returns
     -------
-    dict
-        Dictionary with flat components:
-        - 'summary': pd.DataFrame with one row per (pair_id, condition) containing
-          pair_id, unit_id, hipp_chan_id, vm_chan_id, condition, trial counts,
-          equalized PAC, z/p-values, significance flag, and optional lag-curve
-          samples flattened into scalar columns named lag_curve_<idx>
-        - 'metadata': pd.DataFrame with analysis parameters (phase_band, amp_band,
-          epoch info) - single row
-        - 'lag_info': pd.DataFrame with lag grid information (lag_column_name,
-          lag_value_s) - one row per lag point
-        - 'trial_data': dict with per-pair trial segments and surrogates (optional,
-          for downstream processing)
+    pd.DataFrame
+        Flat table with one row per (pair_id, condition) containing:
+        pair_id, unit_id, hipp_chan_id, vm_chan_id, condition, trial counts,
+        equalized PAC, z/p-values, significance flag, and optional lag-curve
+        samples flattened into scalar columns named lag_curve_<idx>.
+        All metadata (phase_band, amp_band, epoch) is included as columns.
+        No nested structures or attrs.
     """
     def _normalize_band(band: Tuple[float, float] | None):
         if band is None:
@@ -954,7 +901,6 @@ def compute_irpac(
     }
     lag_grid_s = _seq_to_tuple(lag_grid_s)
     lag_column_names = tuple(f"lag_curve_{idx}" for idx in range(len(lag_grid_s))) if lag_grid_s is not None else tuple()
-    per_condition = {cond: {} for cond in conditions}
     if pair_table is None or len(pair_table) == 0:
         return _empty_pac_results(
             conditions=conditions,
@@ -973,7 +919,6 @@ def compute_irpac(
 
     rng = _get_rng(rng_seed)
     summary_rows = []
-    per_pair = {}
 
     lag_samples = None
     if lag_grid_s is not None:
@@ -1028,18 +973,6 @@ def compute_irpac(
         equalized_vals, min_count = equalize_trial_counts(trial_values, repeats=repeats_eq, rng=rng)
         if min_count < min_trials:
             continue
-
-        per_pair[pair.pair_id] = {
-            "trial_segments": trial_segments,
-            "surrogates": {},
-            "meta": {
-                "unit_id": unit_id,
-                "vm_chan": vm_chan,
-                "hipp_chan": hipp_chan,
-            },
-            "conditions": {},
-            "analysis_meta": analysis_meta,
-        }
 
         for idx, cond in enumerate(conditions):
             segments = trial_segments[cond]
@@ -1097,31 +1030,6 @@ def compute_irpac(
                     mask = (np.abs(np.array(lag_grid_s)) >= excl_low) & (np.abs(np.array(lag_grid_s)) <= excl_high)
                     lag_curve = np.where(mask, np.nan, lag_curve)
 
-            surrogate_array = np.asarray(surrogate_values, dtype=float)
-            per_pair[pair.pair_id]["surrogates"][cond] = surrogate_array
-            condition_record = {
-                "n_trials": len(segments),
-                "min_trial_count": min_count,
-                "equalized_pac": equalized_vals.get(cond, np.nan),
-                "observed_pac": obs,
-                "z_pac_theta_gamma": z_value,
-                "lag_curve": lag_curve,
-                "p_value": p_value,
-                "is_significant": is_significant,
-                "alpha": significance_alpha,
-                "surrogate_distribution": surrogate_array,
-                "phase_band_label": phase_band_label,
-                "phase_band_lo_hz": phase_lo,
-                "phase_band_hi_hz": phase_hi,
-                "amp_band_label": amp_band_label,
-                "amp_band_lo_hz": amp_lo,
-                "amp_band_hi_hz": amp_hi,
-                "epoch_label": epoch_label,
-                "epoch_start_s": epoch_start,
-                "epoch_end_s": epoch_end,
-            }
-            per_pair[pair.pair_id]["conditions"][cond] = condition_record
-            per_condition.setdefault(cond, {})[pair.pair_id] = condition_record
             lag_curve_columns = {}
             if lag_column_names:
                 for idx, col_name in enumerate(lag_column_names):
@@ -1158,180 +1066,7 @@ def compute_irpac(
                 }
             )
 
-    summary_df = pd.DataFrame(summary_rows)
-
-    # Create flat metadata DataFrame (single row)
-    metadata_df = pd.DataFrame([{
-        "phase_band_label": phase_band_label,
-        "phase_band_lo_hz": phase_lo,
-        "phase_band_hi_hz": phase_hi,
-        "amp_band_label": amp_band_label,
-        "amp_band_lo_hz": amp_lo,
-        "amp_band_hi_hz": amp_hi,
-        "epoch_label": epoch_label,
-        "epoch_start_s": epoch_start,
-        "epoch_end_s": epoch_end,
-    }])
-
-    # Create flat lag_info DataFrame (one row per lag point)
-    if lag_grid_s is not None and len(lag_grid_s) > 0:
-        lag_info_df = pd.DataFrame([
-            {"lag_column_name": col_name, "lag_value_s": lag_val}
-            for col_name, lag_val in zip(lag_column_names, lag_grid_s)
-        ])
-    else:
-        lag_info_df = pd.DataFrame(columns=["lag_column_name", "lag_value_s"])
-
-    return {
-        "summary": summary_df,
-        "metadata": metadata_df,
-        "lag_info": lag_info_df,
-        "trial_data": per_pair,
-    }
-
-
-def compute_pair_pac_presence(
-    *,
-    pac_results: pd.DataFrame | None,
-    conditions: Sequence[str],
-    min_trials: int,
-    n_surrogates: int,
-    direction_label: str = "hipp_to_vm",
-    freq_label: str = "gamma",
-    z_threshold: float = 1.64,
-    percentile: float = 95.0,
-    fdr_alpha: float = 0.05,
-    rng_seed: int | None = None,
-) -> pd.DataFrame:
-    """
-    Determine per-pair PAC presence by pooling all available trials across conditions.
-
-    Trials from each condition are concatenated (after enforcing a minimum count), and
-    the pooled MVL is compared against deranged trial-shuffle surrogates to obtain
-    both z-scores and empirical percentile thresholds. FDR correction is optionally
-    applied within each (direction, freq) group using the BH procedure.
-    """
-    if pac_results is None or not isinstance(pac_results, pd.DataFrame):
-        return pd.DataFrame()
-    per_pair = pac_results.attrs.get("per_pair", {})
-    if not per_pair:
-        return pd.DataFrame()
-    if len(conditions) != 2:
-        raise ValueError("compute_pair_pac_presence currently expects exactly two conditions.")
-
-    cond_a, cond_b = conditions
-    rng = _get_rng(rng_seed)
-    rows = []
-
-    for pair_id, payload in per_pair.items():
-        trial_segments = payload.get("trial_segments", {})
-        segments_a = list(trial_segments.get(cond_a, []))
-        segments_b = list(trial_segments.get(cond_b, []))
-        counts = {cond_a: len(segments_a), cond_b: len(segments_b)}
-        if any(count < min_trials for count in counts.values()):
-            continue
-        n_star = min(counts.values())
-        if n_star == 0:
-            continue
-
-        pooled_segments = []
-        used_counts = {cond_a: 0, cond_b: 0}
-        for cond, cond_segments in ((cond_a, segments_a), (cond_b, segments_b)):
-            for segment in cond_segments:
-                pooled_segments.append((cond, segment))
-                used_counts[cond] += 1
-        if len(pooled_segments) < 2:
-            continue
-
-        order = rng.permutation(len(pooled_segments))
-        pooled_segments = [pooled_segments[i] for i in order]
-        phase_segments = [seg[0] for _, seg in pooled_segments]
-        amp_segments = [seg[1] for _, seg in pooled_segments]
-        pac_value = _pac_from_segment_lists(phase_segments, amp_segments)
-        if np.isnan(pac_value):
-            continue
-
-        surrogate_vals = []
-        if n_surrogates > 0 and len(phase_segments) > 1:
-            for _ in range(n_surrogates):
-                perm = _random_derangement(len(phase_segments), rng)
-                if perm is None:
-                    break
-                shuffled_amp = [amp_segments[i] for i in perm]
-                surrogate = _pac_from_segment_lists(phase_segments, shuffled_amp)
-                if not np.isnan(surrogate):
-                    surrogate_vals.append(surrogate)
-
-        surrogate_vals = np.array(surrogate_vals, dtype=float)
-        surrogate_vals = surrogate_vals[~np.isnan(surrogate_vals)]
-        mu = float(np.mean(surrogate_vals)) if surrogate_vals.size else np.nan
-        sigma = float(np.std(surrogate_vals, ddof=0)) if surrogate_vals.size else np.nan
-        z_value = float((pac_value - mu) / sigma) if surrogate_vals.size and sigma > 0 else np.nan
-        perc_threshold = (
-            float(np.percentile(surrogate_vals, percentile)) if surrogate_vals.size else np.nan
-        )
-        p_empirical = (
-            float(1.0 + np.sum(surrogate_vals >= pac_value)) / float(surrogate_vals.size + 1.0)
-            if surrogate_vals.size
-            else np.nan
-        )
-
-        rows.append(
-            {
-                "pair_id": pair_id,
-                "direction": direction_label,
-                "freq_label": freq_label,
-                "cond_a_label": cond_a,
-                "cond_b_label": cond_b,
-                "n_trials_cond_a": counts[cond_a],
-                "n_trials_cond_b": counts[cond_b],
-                "n_star": int(n_star),
-                "n_used_cond_a": int(used_counts[cond_a]),
-                "n_used_cond_b": int(used_counts[cond_b]),
-                "n_pooled_trials": int(len(pooled_segments)),
-                "pac_value": float(pac_value),
-                "surrogate_mean": mu,
-                "surrogate_std": sigma,
-                "surrogate_percentile": perc_threshold,
-                "z_pooled": z_value,
-                "p_empirical": p_empirical,
-                "is_pac_positive_z": bool(not np.isnan(z_value) and z_value >= z_threshold),
-                "is_pac_positive_percentile": bool(
-                    not np.isnan(perc_threshold) and pac_value > perc_threshold
-                ),
-                "n_surrogates": int(surrogate_vals.size),
-                "z_threshold": float(z_threshold),
-                "percentile": float(percentile),
-                "fdr_alpha": float(fdr_alpha),
-                "meta_unit_id": payload.get("meta", {}).get("unit_id"),
-                "meta_vm_chan": payload.get("meta", {}).get("vm_chan"),
-                "meta_hipp_chan": payload.get("meta", {}).get("hipp_chan"),
-            }
-        )
-        continue
-
-    presence_df = pd.DataFrame(rows)
-    if presence_df.empty:
-        return presence_df
-
-    presence_df["p_fdr"] = np.nan
-    presence_df["fdr_significant"] = False
-    if fdr_alpha is not None and fdr_alpha > 0:
-        grouped = presence_df.groupby(["direction", "freq_label"], dropna=False)
-        for _, idx in grouped.groups.items():
-            idx = list(idx)
-            if not idx:
-                continue
-            mask = presence_df.loc[idx, "p_empirical"].notna()
-            if not mask.any():
-                continue
-            valid_idx = np.array(idx)[mask.to_numpy(dtype=bool)]
-            pvals = presence_df.loc[valid_idx, "p_empirical"].to_numpy(dtype=float)
-            reject, corrected = fdrcorrection(pvals, alpha=fdr_alpha)
-            presence_df.loc[valid_idx, "p_fdr"] = corrected
-            presence_df.loc[valid_idx, "fdr_significant"] = reject
-
-    return presence_df
+    return pd.DataFrame(summary_rows)
 
 
 def run_session_stats(
@@ -1392,83 +1127,6 @@ def run_session_stats(
         }
 
     return stats
-
-
-def plot_pair_level_qc(
-    *,
-    pair_id: str,
-    sfc_results: pd.DataFrame | None,
-    pac_results: pd.DataFrame | None,
-    theta_phase: Mapping[int, np.ndarray],
-    gamma_envelope: Mapping[int, np.ndarray] | None,
-    trial_table: pd.DataFrame,
-    lfp_fs: float,
-    epoch_analyze: Tuple[float, float],
-    lfp_start_time: float,
-    conditions: Sequence[str],
-    output_dir: str | Path,
-    dpi: int = 150,
-) -> Path | None:
-    """Plot per-pair QC including phase histograms and example traces."""
-    if not isinstance(sfc_results, pd.DataFrame):
-        return None
-
-    sfc_per_pair = sfc_results.attrs.get("per_pair", {})
-    if pair_id not in sfc_per_pair:
-        return None
-
-    pair_info = sfc_per_pair[pair_id]
-    meta = pair_info.get("meta", {})
-    chan_id = meta.get("chan_id")
-    if chan_id is None or chan_id not in theta_phase:
-        return None
-
-    theta_signal = theta_phase[chan_id]
-    hipp_chan = None
-    pac_per_pair = pac_results.attrs.get("per_pair", {}) if isinstance(pac_results, pd.DataFrame) else {}
-    if pac_per_pair and pair_id in pac_per_pair:
-        hipp_chan = pac_per_pair[pair_id]["meta"].get("hipp_chan")
-    gamma_signal = gamma_envelope.get(hipp_chan) if gamma_envelope and hipp_chan in gamma_envelope else None
-
-    fig = plt.figure(figsize=(12, 5))
-    ax_polar = fig.add_subplot(1, 2, 1, projection="polar")
-    colors = sns.color_palette("Set2", len(conditions))
-
-    for color, cond in zip(colors, conditions):
-        phases = pair_info["phase_lists"].get(cond)
-        if phases is None or len(phases) == 0:
-            continue
-        ax_polar.hist(phases, bins=30, alpha=0.5, color=color, label=cond)
-    ax_polar.set_title(f"{pair_id} – Phase histograms")
-    ax_polar.legend(loc="upper right", fontsize=8)
-
-    ax_ts = fig.add_subplot(1, 2, 2)
-    example_trial = trial_table[trial_table["condition_label"].isin(conditions)].head(1)
-    if not example_trial.empty:
-        trial = example_trial.iloc[0]
-        start_time = trial["maint_onset_time"] + epoch_analyze[0]
-        end_time = start_time + 1.5  # 1.5 s snippet
-        start_idx = int(max(0, np.floor((start_time - lfp_start_time) * lfp_fs)))
-        end_idx = int(min(len(theta_signal), np.ceil((end_time - lfp_start_time) * lfp_fs)))
-        times = np.arange(start_idx, end_idx) / lfp_fs + lfp_start_time
-        ax_ts.plot(times, np.sin(theta_signal[start_idx:end_idx]), label="vmPFC θ (sin)", color="#1f77b4")
-        if gamma_signal is not None:
-            ax_ts.plot(times, gamma_signal[start_idx:end_idx], label="Hipp γ amp", color="#ff7f0e", alpha=0.7)
-        ax_ts.set_xlabel("Time (s)")
-        ax_ts.set_ylabel("Normalized amplitude")
-        ax_ts.set_title(f"{pair_id} – Example trial snippet")
-        ax_ts.legend()
-    else:
-        ax_ts.axis("off")
-        ax_ts.set_title("No example trial available")
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"{pair_id}_qc.png"
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=dpi)
-    plt.close(fig)
-    return out_path
 
 
 def plot_session_summary(

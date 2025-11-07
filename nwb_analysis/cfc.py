@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import warnings
 from pathlib import Path
 from typing import Dict, Mapping, Sequence, Tuple, Union
 
@@ -11,8 +12,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from pynwb import NWBHDF5IO
+from pynwb.core import DynamicTable
 from scipy.signal import butter, filtfilt, hilbert
 from scipy.stats import norm, wilcoxon
+from statsmodels.stats.multitest import fdrcorrection
 
 from .data_loading import load_lfp_safe, load_nwb_file
 
@@ -497,6 +501,41 @@ def equalize_trial_counts(values_by_cond, repeats=200, rng=None):
     return averaged, min_trials
 
 
+def _pac_from_segment_lists(phase_segments, amp_segments):
+    """Concatenate phase/amp trial segments (with length matching) and compute PAC MVL."""
+    phase_concat = []
+    amp_concat = []
+    for phase_seg, amp_seg in zip(phase_segments, amp_segments):
+        phase_arr = _to_numpy(phase_seg)
+        amp_arr = _to_numpy(amp_seg)
+        length = min(phase_arr.size, amp_arr.size)
+        if length == 0:
+            continue
+        phase_concat.append(phase_arr[:length])
+        amp_concat.append(amp_arr[:length])
+    if not phase_concat:
+        return np.nan
+    phase_full = np.concatenate(phase_concat)
+    amp_full = np.concatenate(amp_concat)
+    return pac_mvl(phase_full, amp_full)
+
+
+def _random_derangement(length: int, rng: np.random.Generator) -> np.ndarray | None:
+    """Return a permutation with no fixed points (derangement)."""
+    if length < 2:
+        return None
+    perm = rng.permutation(length)
+    indices = np.arange(length)
+    for idx in range(length):
+        if perm[idx] == idx:
+            swap_idx = (idx + 1) % length
+            perm[idx], perm[swap_idx] = perm[swap_idx], perm[idx]
+    if np.any(perm == indices):
+        # Fallback to a simple cyclic shift to guarantee a derangement.
+        perm = (indices + 1) % length
+    return perm
+
+
 def pac_mvl(phase, amp):
     """Amplitude-weighted MVL (amp normalized to mean=1)."""
     phase = _to_numpy(phase)
@@ -533,6 +572,30 @@ def pac_trialshuffle_zscore(values_obs, values_surr):
     if sigma == 0:
         return np.nan
     return (obs - mu) / sigma
+
+
+def pac_surrogate_pvalue(values_obs, values_surr, tail: str = "greater") -> float:
+    """Empirical one- or two-tailed p-value from surrogate PAC distribution."""
+    if values_obs is None:
+        return np.nan
+    obs = float(values_obs)
+    if np.isnan(obs):
+        return np.nan
+    surr = _to_numpy(values_surr)
+    if surr.size == 0:
+        return np.nan
+    surr = surr[~np.isnan(surr)]
+    if surr.size == 0:
+        return np.nan
+    if tail == "less":
+        extreme = np.sum(surr <= obs)
+    elif tail == "two-sided":
+        higher = np.sum(surr >= obs)
+        lower = np.sum(surr <= obs)
+        extreme = min(higher, lower)
+    else:
+        extreme = np.sum(surr >= obs)
+    return (extreme + 1.0) / (surr.size + 1.0)
 
 
 def build_spike_field_pairs(
@@ -758,6 +821,7 @@ def compute_irpac(
     repeats_eq: int = 200,
     lag_grid_s: Sequence[float] | None = None,
     exclude_lag_s: Tuple[float, float] | None = None,
+    significance_alpha: float = 0.05,
     rng_seed: int | None = None,
 ) -> dict:
     """Compute hippocampal gamma ↔ vmPFC theta ir-PAC per pair/condition."""
@@ -866,6 +930,8 @@ def compute_irpac(
                         )
 
             z_value = pac_trialshuffle_zscore(obs, surrogate_values)
+            p_value = pac_surrogate_pvalue(obs, surrogate_values, tail="greater")
+            is_significant = bool(not np.isnan(p_value) and p_value <= significance_alpha)
 
             lag_curve = None
             if lag_samples is not None:
@@ -903,11 +969,158 @@ def compute_irpac(
                     "equalized_pac": equalized_vals.get(cond, np.nan),
                     "z_pac_theta_gamma": z_value,
                     "lag_curve": lag_curve,
+                    "p_pac_theta_gamma": p_value,
+                    "is_pac_significant": is_significant,
+                    "alpha": significance_alpha,
                 }
             )
 
     summary_df = pd.DataFrame(summary_rows)
     return {"summary": summary_df, "per_pair": per_pair, "lag_grid_s": lag_grid_s}
+
+
+def compute_pair_pac_presence(
+    *,
+    pac_results: dict | None,
+    conditions: Sequence[str],
+    min_trials: int,
+    n_surrogates: int,
+    direction_label: str = "hipp_to_vm",
+    freq_label: str = "gamma",
+    z_threshold: float = 1.64,
+    percentile: float = 95.0,
+    fdr_alpha: float = 0.05,
+    rng_seed: int | None = None,
+) -> pd.DataFrame:
+    """
+    Determine per-pair PAC presence by pooling all available trials across conditions.
+
+    Trials from each condition are concatenated (after enforcing a minimum count), and
+    the pooled MVL is compared against deranged trial-shuffle surrogates to obtain
+    both z-scores and empirical percentile thresholds. FDR correction is optionally
+    applied within each (direction, freq) group using the BH procedure.
+    """
+    if pac_results is None:
+        return pd.DataFrame()
+    per_pair = pac_results.get("per_pair")
+    if not per_pair:
+        return pd.DataFrame()
+    if len(conditions) != 2:
+        raise ValueError("compute_pair_pac_presence currently expects exactly two conditions.")
+
+    cond_a, cond_b = conditions
+    rng = _get_rng(rng_seed)
+    rows = []
+
+    for pair_id, payload in per_pair.items():
+        trial_segments = payload.get("trial_segments", {})
+        segments_a = list(trial_segments.get(cond_a, []))
+        segments_b = list(trial_segments.get(cond_b, []))
+        counts = {cond_a: len(segments_a), cond_b: len(segments_b)}
+        if any(count < min_trials for count in counts.values()):
+            continue
+        n_star = min(counts.values())
+        if n_star == 0:
+            continue
+
+        pooled_segments = []
+        used_counts = {cond_a: 0, cond_b: 0}
+        for cond, cond_segments in ((cond_a, segments_a), (cond_b, segments_b)):
+            for segment in cond_segments:
+                pooled_segments.append((cond, segment))
+                used_counts[cond] += 1
+        if len(pooled_segments) < 2:
+            continue
+
+        order = rng.permutation(len(pooled_segments))
+        pooled_segments = [pooled_segments[i] for i in order]
+        phase_segments = [seg[0] for _, seg in pooled_segments]
+        amp_segments = [seg[1] for _, seg in pooled_segments]
+        pac_value = _pac_from_segment_lists(phase_segments, amp_segments)
+        if np.isnan(pac_value):
+            continue
+
+        surrogate_vals = []
+        if n_surrogates > 0 and len(phase_segments) > 1:
+            for _ in range(n_surrogates):
+                perm = _random_derangement(len(phase_segments), rng)
+                if perm is None:
+                    break
+                shuffled_amp = [amp_segments[i] for i in perm]
+                surrogate = _pac_from_segment_lists(phase_segments, shuffled_amp)
+                if not np.isnan(surrogate):
+                    surrogate_vals.append(surrogate)
+
+        surrogate_vals = np.array(surrogate_vals, dtype=float)
+        surrogate_vals = surrogate_vals[~np.isnan(surrogate_vals)]
+        mu = float(np.mean(surrogate_vals)) if surrogate_vals.size else np.nan
+        sigma = float(np.std(surrogate_vals, ddof=0)) if surrogate_vals.size else np.nan
+        z_value = float((pac_value - mu) / sigma) if surrogate_vals.size and sigma > 0 else np.nan
+        perc_threshold = (
+            float(np.percentile(surrogate_vals, percentile)) if surrogate_vals.size else np.nan
+        )
+        p_empirical = (
+            float(1.0 + np.sum(surrogate_vals >= pac_value)) / float(surrogate_vals.size + 1.0)
+            if surrogate_vals.size
+            else np.nan
+        )
+
+        rows.append(
+            {
+                "pair_id": pair_id,
+                "direction": direction_label,
+                "freq_label": freq_label,
+                "cond_a_label": cond_a,
+                "cond_b_label": cond_b,
+                "n_trials_cond_a": counts[cond_a],
+                "n_trials_cond_b": counts[cond_b],
+                "n_star": int(n_star),
+                "n_used_cond_a": int(used_counts[cond_a]),
+                "n_used_cond_b": int(used_counts[cond_b]),
+                "n_pooled_trials": int(len(pooled_segments)),
+                "pac_value": float(pac_value),
+                "surrogate_mean": mu,
+                "surrogate_std": sigma,
+                "surrogate_percentile": perc_threshold,
+                "z_pooled": z_value,
+                "p_empirical": p_empirical,
+                "is_pac_positive_z": bool(not np.isnan(z_value) and z_value >= z_threshold),
+                "is_pac_positive_percentile": bool(
+                    not np.isnan(perc_threshold) and pac_value > perc_threshold
+                ),
+                "n_surrogates": int(surrogate_vals.size),
+                "z_threshold": float(z_threshold),
+                "percentile": float(percentile),
+                "fdr_alpha": float(fdr_alpha),
+                "meta_unit_id": payload.get("meta", {}).get("unit_id"),
+                "meta_vm_chan": payload.get("meta", {}).get("vm_chan"),
+                "meta_hipp_chan": payload.get("meta", {}).get("hipp_chan"),
+            }
+        )
+        continue
+
+    presence_df = pd.DataFrame(rows)
+    if presence_df.empty:
+        return presence_df
+
+    presence_df["p_fdr"] = np.nan
+    presence_df["fdr_significant"] = False
+    if fdr_alpha is not None and fdr_alpha > 0:
+        grouped = presence_df.groupby(["direction", "freq_label"], dropna=False)
+        for _, idx in grouped.groups.items():
+            idx = list(idx)
+            if not idx:
+                continue
+            mask = presence_df.loc[idx, "p_empirical"].notna()
+            if not mask.any():
+                continue
+            valid_idx = np.array(idx)[mask.to_numpy(dtype=bool)]
+            pvals = presence_df.loc[valid_idx, "p_empirical"].to_numpy(dtype=float)
+            reject, corrected = fdrcorrection(pvals, alpha=fdr_alpha)
+            presence_df.loc[valid_idx, "p_fdr"] = corrected
+            presence_df.loc[valid_idx, "fdr_significant"] = reject
+
+    return presence_df
 
 
 def run_session_stats(
@@ -1119,13 +1332,67 @@ def plot_session_summary(
     return plots
 
 
+def write_pac_presence_to_nwb(
+    *,
+    session_path: str | Path,
+    pac_presence: pd.DataFrame,
+    module_name: str = "irpac",
+    table_name: str = "pac_presence",
+) -> Path | None:
+    """Store per-pair PAC presence metrics inside the NWB processing module."""
+    if pac_presence is None or pac_presence.empty:
+        return None
+    session_path = Path(session_path)
+    if not session_path.exists():
+        raise FileNotFoundError(session_path)
+
+    io = NWBHDF5IO(str(session_path), "r+")
+    nwbfile = io.read()
+    try:
+        if module_name in nwbfile.processing:
+            module = nwbfile.processing[module_name]
+        else:
+            module = nwbfile.create_processing_module(
+                name=module_name,
+                description="Cross-frequency coupling analysis outputs (ir-PAC).",
+            )
+        if table_name in module.data_interfaces:
+            del module.data_interfaces[table_name]
+
+        table = DynamicTable(
+            name=table_name,
+            description="Per-pair hippocampus↔vmPFC ir-PAC presence metrics (all trials).",
+        )
+        for column in pac_presence.columns:
+            table.add_column(name=column, description=f"{column} (ir-PAC metric)")
+
+        for _, row in pac_presence.iterrows():
+            clean_row = {}
+            for key, value in row.items():
+                if isinstance(value, np.generic):
+                    clean_row[key] = value.item()
+                elif pd.isna(value):
+                    clean_row[key] = np.nan
+                else:
+                    clean_row[key] = value
+            table.add_row(**clean_row)
+
+        module.add_data_interface(table)
+        io.write(nwbfile)
+    finally:
+        io.close()
+    return session_path
+
+
 def save_session_outputs(
     *,
     session_id: str,
     output_dir: str | Path,
+    session_path: str | Path | None = None,
     pair_table: pd.DataFrame | None,
     sfc_results: dict | None,
     pac_results: dict | None,
+    pac_presence: pd.DataFrame | None = None,
     stats_summary: dict | None,
     analysis_params: dict | None = None,
 ) -> dict:
@@ -1148,6 +1415,18 @@ def save_session_outputs(
         pac_path = output_dir / f"{session_id}_pac_summary.csv"
         pac_results["summary"].to_csv(pac_path, index=False)
         artifacts["pac_summary"] = pac_path
+
+    if (
+        session_path is not None
+        and pac_presence is not None
+        and isinstance(pac_presence, pd.DataFrame)
+        and not pac_presence.empty
+    ):
+        try:
+            write_pac_presence_to_nwb(session_path=session_path, pac_presence=pac_presence)
+            artifacts["pac_presence_nwb"] = str(Path(session_path))
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"Failed to store PAC presence in NWB: {exc}")
 
     summary_payload = {
         "session_id": session_id,

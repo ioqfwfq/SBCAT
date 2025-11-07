@@ -829,7 +829,7 @@ def _empty_pac_results(
         "epoch_end_s",
         "n_trials",
         "min_trial_count",
-        "equalized_pac",
+        "mean_pac",
         "z_pac_theta_gamma",
         *lag_column_names,
         "p_pac_theta_gamma",
@@ -837,6 +837,32 @@ def _empty_pac_results(
         "alpha",
     ]
     return pd.DataFrame(columns=columns)
+
+
+def _generate_derangement(n: int, rng) -> np.ndarray:
+    """Generate a random derangement (permutation with no fixed points)."""
+    if n < 2:
+        raise ValueError("Derangement requires at least 2 elements")
+
+    # Start with a random permutation
+    perm = rng.permutation(n)
+
+    # Fix any fixed points
+    for i in range(n):
+        if perm[i] == i:
+            # Find a position j where perm[j] != j and perm[j] != i
+            for j in range(i + 1, n):
+                if perm[j] != j and perm[j] != i:
+                    perm[i], perm[j] = perm[j], perm[i]
+                    break
+            else:
+                # If we can't find such a j, swap with any j > i where perm[j] != i
+                for j in range(i + 1, n):
+                    if perm[j] != i:
+                        perm[i], perm[j] = perm[j], perm[i]
+                        break
+
+    return perm
 
 
 def compute_irpac(
@@ -851,7 +877,6 @@ def compute_irpac(
     conditions: Sequence[str],
     min_trials: int,
     n_surrogates: int,
-    repeats_eq: int = 200,
     lag_grid_s: Sequence[float] | None = None,
     exclude_lag_s: Tuple[float, float] | None = None,
     significance_alpha: float = 0.05,
@@ -970,7 +995,9 @@ def compute_irpac(
         if any(count == 0 for count in counts.values()):
             continue
 
-        equalized_vals, min_count = equalize_trial_counts(trial_values, repeats=repeats_eq, rng=rng)
+        # Compute mean PAC per condition from trial-level values
+        mean_pac_vals = {cond: np.nanmean(vals) for cond, vals in trial_values.items()}
+        min_count = min(counts.values())
         if min_count < min_trials:
             continue
 
@@ -980,7 +1007,7 @@ def compute_irpac(
                 continue
             phase_concat = np.concatenate([seg[0] for seg in segments])
             amp_concat = np.concatenate([seg[1] for seg in segments])
-            obs = pac_mvl(phase_concat, amp_concat)
+            obs = pac_mvl(phase_concat, amp_concat)  # MVL-MI from concatenated trials
 
             # Trial-shuffle surrogates
             surrogate_values = []
@@ -988,7 +1015,7 @@ def compute_irpac(
                 phase_segments = [seg[0] for seg in segments]
                 amp_segments = [seg[1] for seg in segments]
                 for _ in range(n_surrogates):
-                    permuted = rng.permutation(len(amp_segments))
+                    permuted = _generate_derangement(len(amp_segments), rng)
                     shuffled_amp_segments = [amp_segments[i] for i in permuted]
                     shuffled_amp = []
                     shuffled_phase = []
@@ -1057,7 +1084,7 @@ def compute_irpac(
                     "epoch_end_s": epoch_end,
                     "n_trials": len(segments),
                     "min_trial_count": min_count,
-                    "equalized_pac": equalized_vals.get(cond, np.nan),
+                    "mean_pac": mean_pac_vals.get(cond, np.nan),
                     "z_pac_theta_gamma": z_value,
                     **lag_curve_columns,
                     "p_pac_theta_gamma": p_value,

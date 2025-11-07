@@ -1,0 +1,47 @@
+# Data folder - ignore all NWB files
+000673/
+
+# Analysis outputs
+analysis_output/
+
+# Figures
+figures/
+
+# Results (CSV files are typically large data outputs)
+results/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Large files
+*.nwb
+*.h5
+*.hdf5
+
+# Backup and alternate version files
+*_backup.ipynb
+*_clean.ipynb
+

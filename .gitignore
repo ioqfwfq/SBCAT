@@ -1,5 +1,6 @@
 # Data folder - ignore all NWB files
 000673/
+000469/
 
 # Analysis outputs
 analysis_output/

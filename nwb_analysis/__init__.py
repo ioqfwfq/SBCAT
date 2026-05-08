@@ -36,12 +36,18 @@ from .spectral import (
     compute_all_region_epoch_psds
 )
 
-from .spectrogram import (
-    extract_event_aligned_segments,
-    compute_spectrogram_by_groups_stft,
-    compute_spectrogram_by_groups_cwt,
-    plot_spectrogram_by_groups
-)
+# Spectrogram module depends on pywt (PyWavelets); make it optional so the
+# rest of the package still loads in environments without it.
+try:
+    from .spectrogram import (
+        extract_event_aligned_segments,
+        compute_spectrogram_by_groups_stft,
+        compute_spectrogram_by_groups_cwt,
+        plot_spectrogram_by_groups,
+    )
+    _HAS_SPECTROGRAM = True
+except ImportError:
+    _HAS_SPECTROGRAM = False
 
 # Import configuration constants
 from .config import (
@@ -74,11 +80,6 @@ __all__ = [
     'fit_1f_background',
     'compute_epoch_psd_for_region',
     'compute_all_region_epoch_psds',
-    # Spectrogram
-    'extract_event_aligned_segments',
-    'compute_spectrogram_by_groups_stft',
-    'compute_spectrogram_by_groups_cwt',
-    'plot_spectrogram_by_groups',
     # Config
     'FREQ_BANDS',
     'BRAIN_REGIONS',
@@ -89,4 +90,12 @@ __all__ = [
     'WELCH_OVERLAP',
     'FREQ_RANGE',
 ]
+
+if _HAS_SPECTROGRAM:
+    __all__ += [
+        'extract_event_aligned_segments',
+        'compute_spectrogram_by_groups_stft',
+        'compute_spectrogram_by_groups_cwt',
+        'plot_spectrogram_by_groups',
+    ]
 

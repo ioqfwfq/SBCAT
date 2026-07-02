@@ -1,0 +1,1672 @@
+"""Cross-frequency coupling helpers for SFC and ir-PAC analyses."""
+
+from __future__ import annotations
+
+import json
+import pickle
+import warnings
+from pathlib import Path
+from typing import Dict, Mapping, Sequence, Tuple, Union
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from pynwb import NWBHDF5IO
+from pynwb.core import DynamicTable
+from scipy.signal import butter, filtfilt, hilbert
+from scipy.stats import norm, wilcoxon
+from statsmodels.stats.multitest import fdrcorrection
+
+from .data_loading import load_lfp_safe, load_nwb_file
+
+
+def _to_numpy(data: Sequence[float] | np.ndarray | None) -> np.ndarray:
+    """Convert arbitrary sequences (or None) to a 1D float array."""
+    if data is None:
+        return np.empty(0, dtype=float)
+    if isinstance(data, np.ndarray):
+        arr = data
+    else:
+        arr = np.asarray(list(data), dtype=float)
+    return arr.astype(float, copy=False)
+
+
+def _get_rng(seed=None):
+    """Return a numpy Generator from None/int/Generator inputs."""
+    if seed is None:
+        return np.random.default_rng()
+    if isinstance(seed, np.random.Generator):
+        return seed
+    return np.random.default_rng(seed)
+
+
+def _infer_area(location: str | None) -> str:
+    """Infer gross anatomical area label from electrode location string."""
+    if location is None or (isinstance(location, float) and np.isnan(location)):
+        return "unknown"
+    loc = str(location).lower()
+    if "hipp" in loc:
+        return "hipp"
+    if ("pfc" in loc and ("vm" in loc or "ventral" in loc)) or ("prefrontal" in loc and "ventral" in loc):
+        return "vmPFC"
+    if "acc" in loc:
+        return "dACC"
+    if "amyg" in loc:
+        return "amyg"
+    if "sma" in loc:
+        return "preSMA"
+    return loc.replace("_", " ")
+
+
+def _infer_hemisphere(location: str | None) -> str:
+    """Infer hemisphere from electrode or unit location text."""
+    if location is None or (isinstance(location, float) and np.isnan(location)):
+        return "unknown"
+    loc = str(location).lower()
+    if "left" in loc or loc.endswith("_l"):
+        return "L"
+    if "right" in loc or loc.endswith("_r"):
+        return "R"
+    if loc.endswith("l") and not loc.endswith("al"):
+        return "L"
+    if loc.endswith("r"):
+        return "R"
+    return "unknown"
+
+
+def _as_dataframe(table: Union[pd.DataFrame, Sequence[dict]]) -> pd.DataFrame:
+    if isinstance(table, pd.DataFrame):
+        return table.copy()
+    return pd.DataFrame(list(table))
+
+
+def _validate_cache_payload(payload: dict) -> bool:
+    required = {
+        "trial_table",
+        "spike_times_by_unit",
+        "unit_meta",
+        "lfp_by_channel",
+        "lfp_fs",
+        "channel_meta",
+        "session_meta",
+        "lfp_start_time",
+    }
+    return required.issubset(payload.keys())
+
+
+def _save_session_cache(cache_path: Path, payload: dict) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("wb") as f:
+        pickle.dump(payload, f)
+
+
+def _load_session_cache(cache_path: Path) -> dict | None:
+    if not cache_path.exists():
+        return None
+    with cache_path.open("rb") as f:
+        payload = pickle.load(f)
+    if not isinstance(payload, dict) or not _validate_cache_payload(payload):
+        raise ValueError(f"Invalid cache structure at {cache_path}")
+    return payload
+
+
+def _pad_signal(signal: np.ndarray, pad_samples: int) -> tuple[np.ndarray, slice]:
+    """Reflect-pad a 1D signal and return padded copy plus slicing indices."""
+    if pad_samples <= 0:
+        return signal, slice(None)
+    padded = np.pad(signal, pad_samples, mode="reflect")
+    valid_slice = slice(pad_samples, -pad_samples)
+    return padded, valid_slice
+
+
+def _bca_ci(
+    data: np.ndarray,
+    statistic,
+    alpha: float = 0.05,
+    n_boot: int = 2000,
+    rng_seed: int | None = 42,
+) -> Tuple[float, float]:
+    """Bias-corrected accelerated CI for a univariate statistic."""
+    data = np.asarray(data)
+    data = data[~np.isnan(data)]
+    if data.size == 0:
+        return (np.nan, np.nan)
+
+    obs = statistic(data)
+    rng = _get_rng(rng_seed)
+    boot_stats = []
+    for _ in range(n_boot):
+        sample = rng.choice(data, size=data.size, replace=True)
+        boot_stats.append(statistic(sample))
+    boot_stats = np.array(boot_stats)
+
+    # Bias correction
+    z0 = norm.ppf((boot_stats < obs).mean() or 1e-9)
+
+    # Acceleration via jackknife
+    jackknife_stats = []
+    for idx in range(data.size):
+        jackknife_sample = np.delete(data, idx)
+        jackknife_stats.append(statistic(jackknife_sample))
+    jackknife_stats = np.array(jackknife_stats)
+    jackknife_mean = jackknife_stats.mean()
+    numer = np.sum((jackknife_mean - jackknife_stats) ** 3)
+    denom = 6.0 * (np.sum((jackknife_mean - jackknife_stats) ** 2) ** 1.5)
+    accel = numer / denom if denom != 0 else 0.0
+
+    def percentile(p):
+        z = norm.ppf(p)
+        adj = norm.cdf(z0 + (z0 + z) / (1 - accel * (z0 + z)))
+        adj = np.clip(adj, 0, 1)
+        return np.percentile(boot_stats, adj * 100)
+
+    lower = percentile(alpha / 2)
+    upper = percentile(1 - alpha / 2)
+    return float(lower), float(upper)
+
+
+def _build_trial_table(raw_trials: pd.DataFrame, *, conditions: Sequence[str], use_only_correct: bool, epoch_label: str = "maintenance") -> pd.DataFrame:
+    """Return standardized trial metadata table."""
+    from .config import EVENT_DEFINITIONS
+    
+    trials = raw_trials.copy()
+    trials = trials.reset_index().rename(columns={"index": "trial_id"})
+
+    # Condition label derived from load or fallback to string representation.
+    if "loads" in trials.columns:
+        trials["condition_label"] = trials["loads"].apply(lambda x: f"L{int(x)}" if not pd.isna(x) else "Unknown")
+    else:
+        trials["condition_label"] = "Unknown"
+
+    # Reaction time using probe -> response timestamps if available.
+    if {"timestamps_Response", "timestamps_Probe"}.issubset(trials.columns):
+        trials["rt"] = trials["timestamps_Response"] - trials["timestamps_Probe"]
+    else:
+        trials["rt"] = trials.get("stop_time", np.nan) - trials.get("start_time", np.nan)
+
+    # Epoch onset time - configurable based on epoch_label
+    # Default to maintenance for backward compatibility
+    if epoch_label in EVENT_DEFINITIONS:
+        timestamp_col = EVENT_DEFINITIONS[epoch_label]["timestamp"]
+        trials["epoch_onset_time"] = trials.get(timestamp_col, np.nan)
+        # Also keep maint_onset_time for backward compatibility
+        trials["maint_onset_time"] = trials.get("timestamps_Maintenance", np.nan)
+    else:
+        # Fallback to maintenance if epoch_label not found
+        trials["epoch_onset_time"] = trials.get("timestamps_Maintenance", np.nan)
+        trials["maint_onset_time"] = trials["epoch_onset_time"]
+
+    # Accuracy flag
+    if "response_accuracy" in trials.columns:
+        trials["is_correct"] = trials["response_accuracy"].astype(int) == 1
+    else:
+        trials["is_correct"] = True
+
+    if use_only_correct:
+        trials = trials[trials["is_correct"]]
+
+    # Keep only requested conditions
+    if conditions:
+        trials = trials[trials["condition_label"].isin(conditions)]
+
+    cols = ["trial_id", "condition_label", "rt", "epoch_onset_time", "maint_onset_time", "is_correct"]
+    keep_cols = [col for col in cols if col in trials.columns]
+    trials = trials[keep_cols + [c for c in trials.columns if c not in keep_cols]]
+    return trials.reset_index(drop=True)
+
+
+def _extract_spike_structures(nwbfile) -> tuple[dict, pd.DataFrame]:
+    """Extract spike times and associated metadata."""
+    spike_times_by_unit = {}
+    unit_rows = []
+    if nwbfile.units is None:
+        return spike_times_by_unit, pd.DataFrame(columns=["unit_id", "channel_id", "area", "hemisphere"])
+
+    electrodes_df = nwbfile.electrodes.to_dataframe() if nwbfile.electrodes is not None else pd.DataFrame()
+    unit_ids = nwbfile.units.id[:]
+
+    for idx, unit_id in enumerate(unit_ids):
+        spikes = np.array(nwbfile.units["spike_times"][idx])
+        spike_times_by_unit[int(unit_id)] = spikes
+
+        electrode_region = None
+        electrode_idx = None
+        if "electrodes" in nwbfile.units.colnames:
+            elec_ref = nwbfile.units["electrodes"][idx]
+            if isinstance(elec_ref, (list, np.ndarray)) and len(elec_ref) > 0:
+                electrode_idx = int(elec_ref[0])
+            elif np.isscalar(elec_ref):
+                electrode_idx = int(elec_ref)
+        if electrode_idx is not None and not electrodes_df.empty and electrode_idx in electrodes_df.index:
+            electrode_region = electrodes_df.loc[electrode_idx, "location"]
+
+        area = _infer_area(electrode_region)
+        hemisphere = _infer_hemisphere(electrode_region)
+        unit_rows.append(
+            {
+                "unit_id": int(unit_id),
+                "channel_id": electrode_idx,
+                "area": area,
+                "hemisphere": hemisphere,
+            }
+        )
+
+    unit_meta = pd.DataFrame(unit_rows)
+    return spike_times_by_unit, unit_meta
+
+
+def _extract_lfp_structures(nwb_data: dict) -> tuple[dict, pd.DataFrame, float, float]:
+    """Return {chan_id: signal}, channel metadata, sampling rate, and start time."""
+    if "lfp" not in nwb_data:
+        raise ValueError("NWB session missing LFP acquisition (expected 'LFPs').")
+
+    lfp_series = nwb_data["lfp"]["series"]
+    electrodes_df = nwb_data["nwbfile"].electrodes.to_dataframe()
+    lfp_data = load_lfp_safe(lfp_series)
+    if lfp_data.ndim == 1:
+        lfp_data = lfp_data[:, np.newaxis]
+
+    if hasattr(lfp_series, "electrodes") and lfp_series.electrodes is not None:
+        electrode_indices = np.array(lfp_series.electrodes.data[:]).astype(int)
+    else:
+        electrode_indices = np.arange(lfp_data.shape[1])
+
+    lfp_by_channel = {}
+    channel_rows = []
+    for col_idx, electrode_idx in enumerate(electrode_indices):
+        signal = lfp_data[:, col_idx].astype(np.float32, copy=False)
+        lfp_by_channel[int(electrode_idx)] = signal
+        row = electrodes_df.loc[electrode_idx] if electrode_idx in electrodes_df.index else {}
+        location = row.get("location") if isinstance(row, pd.Series) else None
+        channel_rows.append(
+            {
+                "chan_id": int(electrode_idx),
+                "lfp_col": int(col_idx),
+                "area": _infer_area(location),
+                "hemisphere": _infer_hemisphere(location),
+                "bad": bool(row.get("bad", False)) if isinstance(row, pd.Series) and "bad" in row else False,
+                "location": location,
+            }
+        )
+
+    channel_meta = pd.DataFrame(channel_rows)
+    lfp_fs = float(getattr(lfp_series, "rate", nwb_data["lfp"].get("sampling_rate", np.nan)))
+    lfp_start_time = float(getattr(lfp_series, "starting_time", 0.0))
+    return lfp_by_channel, channel_meta, lfp_fs, lfp_start_time
+
+
+def _session_metadata(nwbfile, session_id: str | None) -> dict:
+    subject = nwbfile.subject.subject_id if nwbfile.subject else None
+    session_start = str(nwbfile.session_start_time) if hasattr(nwbfile, "session_start_time") else None
+    reference = None
+    if nwbfile.electrodes is not None and "filtering" in nwbfile.electrodes.colnames:
+        ref_vals = nwbfile.electrodes["filtering"][:]
+        if len(ref_vals):
+            reference = ref_vals[0]
+    return {
+        "session_id": session_id or nwbfile.identifier,
+        "subject_id": subject,
+        "session_start_time": session_start,
+        "reference_scheme": reference,
+        "session_description": getattr(nwbfile, "session_description", ""),
+    }
+
+
+def prepare_session_structures(
+    *,
+    session_id: str,
+    session_path: str | Path | None = None,
+    cache_path: str | Path | None = None,
+    use_cache: bool = True,
+    save_cache: bool = False,
+    conditions: Sequence[str] = ("L1", "L3"),
+    use_only_correct: bool = True,
+    epoch_label: str = "maintenance",
+) -> dict:
+    """
+    Adapter that returns canonical data objects expected by downstream analyses.
+
+    Parameters
+    ----------
+    epoch_label : str, default "maintenance"
+        Epoch type to use for analysis. Must be one of: 'encoding1', 'encoding2', 
+        'encoding3', 'maintenance', 'probe'. Determines which timestamp column 
+        is used as the epoch onset reference.
+
+    Returns:
+        dict with keys:
+            trial_table (DataFrame), spike_times_by_unit (dict), unit_meta (DataFrame),
+            lfp_by_channel (dict), lfp_fs (float), lfp_start_time (float),
+            channel_meta (DataFrame), session_meta (dict)
+    """
+
+    cache_path = Path(cache_path) if cache_path else None
+    if use_cache and cache_path:
+        payload = _load_session_cache(cache_path)
+        if payload is not None:
+            return payload
+
+    if session_path is None:
+        raise ValueError("session_path is required when cache is unavailable.")
+
+    session_path = Path(session_path)
+    nwb_data = load_nwb_file(session_path)
+    nwbfile = nwb_data["nwbfile"]
+
+    raw_trials = nwb_data.get("trials")
+    if raw_trials is None:
+        raise ValueError("Trial table not found in NWB session.")
+    trial_table = _build_trial_table(raw_trials, conditions=conditions, use_only_correct=use_only_correct, epoch_label=epoch_label)
+
+    spike_times_by_unit, unit_meta = _extract_spike_structures(nwbfile)
+    lfp_by_channel, channel_meta, lfp_fs, lfp_start_time = _extract_lfp_structures(nwb_data)
+    session_meta = _session_metadata(nwbfile, session_id=session_id)
+
+    payload = {
+        "trial_table": trial_table,
+        "spike_times_by_unit": spike_times_by_unit,
+        "unit_meta": unit_meta,
+        "lfp_by_channel": lfp_by_channel,
+        "lfp_fs": lfp_fs,
+        "lfp_start_time": lfp_start_time,
+        "channel_meta": channel_meta,
+        "session_meta": session_meta,
+    }
+
+    if save_cache and cache_path:
+        _save_session_cache(cache_path, payload)
+
+    nwb_data["io"].close()
+    return payload
+
+
+def bandpass_filtfilt(x, fs, band, order=4):
+    """Zero-phase band-pass filter."""
+    x = _to_numpy(x)
+    nyq = fs / 2.0
+    low, high = band
+    if low <= 0 or high >= nyq:
+        raise ValueError("Band edges must satisfy 0 < low < high < fs/2.")
+    b, a = butter(order, [low / nyq, high / nyq], btype="band")
+    return filtfilt(b, a, x)
+
+
+def theta_phase(lfp, fs, theta_band=(3, 7)):
+    """Return instantaneous phase for theta-filtered LFP."""
+    x = bandpass_filtfilt(lfp, fs, theta_band)
+    return np.angle(hilbert(x))
+
+
+def gamma_amplitude(lfp, fs, gamma_band=(70, 140)):
+    """Return gamma-band amplitude envelope."""
+    x = bandpass_filtfilt(lfp, fs, gamma_band)
+    return np.abs(hilbert(x))
+
+
+def sample_phase_at_spikes(phase_ts, fs, t0, spike_times):
+    """Sample theta phase time-series at spike timestamps (with interpolation)."""
+    phase_ts = _to_numpy(phase_ts)
+    spikes = _to_numpy(spike_times)
+    if phase_ts.size == 0 or spikes.size == 0:
+        return np.empty(0, dtype=float)
+
+    window_end = t0 + (phase_ts.size - 1) / fs
+    valid_mask = (spikes >= t0) & (spikes <= window_end)
+    if not np.any(valid_mask):
+        return np.empty(0, dtype=float)
+
+    spikes = spikes[valid_mask]
+    time_axis = t0 + np.arange(phase_ts.size) / fs
+    unwrapped = np.unwrap(phase_ts)
+    interp_vals = np.interp(spikes, time_axis, unwrapped, left=np.nan, right=np.nan)
+    interp_vals = interp_vals[~np.isnan(interp_vals)]
+    if interp_vals.size == 0:
+        return np.empty(0, dtype=float)
+    wrapped = (interp_vals + np.pi) % (2 * np.pi) - np.pi
+    return wrapped
+
+
+def mvl(phases):
+    """Mean vector length for circular data."""
+    phases = _to_numpy(phases)
+    if phases.size == 0:
+        return np.nan
+    return np.abs(np.mean(np.exp(1j * phases)))
+
+
+def sfc_zscore(phases, jitter_phases_list):
+    """Z-score the observed MVL against jitter-based surrogates."""
+    obs = mvl(phases)
+    if np.isnan(obs):
+        return np.nan
+    if not jitter_phases_list:
+        return np.nan
+    surrogate_vals = np.array([mvl(p) for p in jitter_phases_list], dtype=float)
+    surrogate_vals = surrogate_vals[~np.isnan(surrogate_vals)]
+    if surrogate_vals.size == 0:
+        return np.nan
+    mu = surrogate_vals.mean()
+    sigma = surrogate_vals.std(ddof=0)
+    if sigma == 0:
+        return np.nan
+    return (obs - mu) / sigma
+
+
+def jitter_spikes_within_trial(spike_times, win_start, win_end, jitter_width=0.25, rng=None):
+    """Uniformly jitter spikes within a trial while respecting window bounds."""
+    spikes = _to_numpy(spike_times)
+    if spikes.size == 0:
+        return np.empty(0, dtype=float)
+    rng = _get_rng(rng)
+    jittered = np.empty_like(spikes)
+    for idx, spike in enumerate(spikes):
+        for _ in range(100):
+            candidate = spike + rng.uniform(-jitter_width, jitter_width)
+            if win_start <= candidate <= win_end:
+                jittered[idx] = candidate
+                break
+        else:
+            jittered[idx] = np.clip(spike, win_start, win_end)
+    return jittered
+
+
+def equalize_spike_counts(phase_lists_by_cond, repeats=200, rng=None):
+    """Downsample spike-phase vectors to the minimum count across conditions."""
+    if not phase_lists_by_cond:
+        return {}, 0
+    counts = {cond: len(_to_numpy(phases)) for cond, phases in phase_lists_by_cond.items()}
+    if any(count == 0 for count in counts.values()):
+        return {cond: np.nan for cond in counts}, 0
+    min_count = min(counts.values())
+    rng = _get_rng(rng)
+    mvls_by_cond = {cond: [] for cond in phase_lists_by_cond}
+    for _ in range(repeats):
+        for cond, phases in phase_lists_by_cond.items():
+            phases = _to_numpy(phases)
+            idx = rng.choice(phases.size, size=min_count, replace=False)
+            sample = phases[idx]
+            mvls_by_cond[cond].append(mvl(sample))
+    averaged = {
+        cond: float(np.nanmean(vals)) if len(vals) else np.nan
+        for cond, vals in mvls_by_cond.items()
+    }
+    return averaged, min_count
+
+
+def equalize_trial_counts(values_by_cond, repeats=200, rng=None):
+    """Downsample trial-level metrics to the minimum trial count across conditions."""
+    if not values_by_cond:
+        return {}, 0
+    counts = {}
+    cleaned = {}
+    for cond, values in values_by_cond.items():
+        arr = _to_numpy(values)
+        arr = arr[~np.isnan(arr)]
+        cleaned[cond] = arr
+        counts[cond] = arr.size
+    if any(count == 0 for count in counts.values()):
+        return {cond: np.nan for cond in values_by_cond}, 0
+    min_trials = min(counts.values())
+    rng = _get_rng(rng)
+    agg = {cond: [] for cond in values_by_cond}
+    for _ in range(repeats):
+        for cond, clean_vals in cleaned.items():
+            if clean_vals.size < min_trials:
+                continue
+            idx = rng.choice(clean_vals.size, size=min_trials, replace=False)
+            agg[cond].append(float(np.nanmean(clean_vals[idx])))
+    averaged = {cond: float(np.nanmean(vals)) if len(vals) else np.nan for cond, vals in agg.items()}
+    return averaged, min_trials
+
+
+def pac_mvl(phase, amp):
+    """Amplitude-weighted MVL (amp normalized to mean=1)."""
+    phase = _to_numpy(phase)
+    amp = _to_numpy(amp)
+    if phase.size == 0 or amp.size == 0 or phase.size != amp.size:
+        return np.nan
+    mask = ~np.isnan(phase) & ~np.isnan(amp)
+    if not np.any(mask):
+        return np.nan
+    phase = phase[mask]
+    amp = amp[mask]
+    mean_amp = np.mean(amp)
+    if mean_amp == 0:
+        return np.nan
+    norm_amp = amp / mean_amp
+    return np.abs(np.sum(norm_amp * np.exp(1j * phase)) / np.sum(norm_amp))
+
+
+def pac_tort_mi(phase, amp, n_bins=18):
+    """Tort's Modulation Index using Kullback-Leibler divergence.
+
+    Measures how much the amplitude distribution across phase bins deviates
+    from uniform distribution. Range: 0 (no modulation) to 1 (perfect modulation).
+
+    Parameters
+    ----------
+    phase : array_like
+        Phase values in radians [-π, π]
+    amp : array_like
+        Amplitude envelope values
+    n_bins : int, default=18
+        Number of phase bins (typically 18 for 20-degree bins)
+
+    Returns
+    -------
+    float
+        Modulation Index value (0 to 1)
+
+    Reference
+    ---------
+    Tort et al. (2010) J Neurophysiol 104(2):1195-1210
+    """
+    phase = _to_numpy(phase)
+    amp = _to_numpy(amp)
+    if phase.size == 0 or amp.size == 0 or phase.size != amp.size:
+        return np.nan
+    mask = ~np.isnan(phase) & ~np.isnan(amp)
+    if not np.any(mask):
+        return np.nan
+    phase = phase[mask]
+    amp = amp[mask]
+
+    # Bin phases into n_bins
+    phase_bins = np.linspace(-np.pi, np.pi, n_bins + 1)
+    bin_indices = np.digitize(phase, phase_bins) - 1
+    bin_indices = np.clip(bin_indices, 0, n_bins - 1)
+
+    # Compute mean amplitude in each bin
+    mean_amp_per_bin = np.zeros(n_bins)
+    for i in range(n_bins):
+        bin_mask = bin_indices == i
+        if np.any(bin_mask):
+            mean_amp_per_bin[i] = np.mean(amp[bin_mask])
+
+    # Normalize to create probability distribution
+    if np.sum(mean_amp_per_bin) == 0:
+        return np.nan
+    p = mean_amp_per_bin / np.sum(mean_amp_per_bin)
+
+    # Uniform distribution
+    uniform = np.ones(n_bins) / n_bins
+
+    # KL divergence (avoid log(0) by adding small epsilon)
+    epsilon = 1e-10
+    kl_div = np.sum(p * np.log((p + epsilon) / (uniform + epsilon)))
+
+    # Normalize by maximum possible KL divergence
+    mi = kl_div / np.log(n_bins)
+
+    return float(mi)
+
+
+def pac_trialshuffle_zscore(values_obs, values_surr):
+    """Z-score an observed PAC value relative to trial-shuffled surrogates.
+
+    Fits a normal distribution to the surrogate values via maximum likelihood
+    estimation to obtain the mean and standard deviation of the null distribution.
+    """
+    if values_obs is None:
+        return np.nan
+    obs = float(values_obs)
+    if np.isnan(obs):
+        return np.nan
+    surr = _to_numpy(values_surr)
+    if surr.size == 0:
+        return np.nan
+    surr = surr[~np.isnan(surr)]
+    if surr.size == 0:
+        return np.nan
+    mu, sigma = norm.fit(surr)  # Fit normal distribution via MLE
+    if sigma == 0:
+        return np.nan
+    return (obs - mu) / sigma
+
+
+def pac_surrogate_pvalue(values_obs, values_surr, tail: str = "greater") -> float:
+    """Empirical one- or two-tailed p-value from surrogate PAC distribution."""
+    if values_obs is None:
+        return np.nan
+    obs = float(values_obs)
+    if np.isnan(obs):
+        return np.nan
+    surr = _to_numpy(values_surr)
+    if surr.size == 0:
+        return np.nan
+    surr = surr[~np.isnan(surr)]
+    if surr.size == 0:
+        return np.nan
+    if tail == "less":
+        extreme = np.sum(surr <= obs)
+    elif tail == "two-sided":
+        higher = np.sum(surr >= obs)
+        lower = np.sum(surr <= obs)
+        extreme = min(higher, lower)
+    else:
+        extreme = np.sum(surr >= obs)
+    return (extreme + 1.0) / (surr.size + 1.0)
+
+
+def build_spike_field_pairs(
+    *,
+    spike_times_by_unit: Mapping[int, np.ndarray],
+    unit_meta: pd.DataFrame,
+    theta_phase: Mapping[int, np.ndarray],
+    channel_meta: pd.DataFrame,
+    hemisphere_only: bool = True,
+) -> pd.DataFrame:
+    """Enumerate hippocampal unit × vmPFC channel pairs."""
+    if not spike_times_by_unit or not theta_phase:
+        return pd.DataFrame(columns=["pair_id", "unit_id", "chan_id", "hemisphere"])
+
+    units = _as_dataframe(unit_meta)
+    channels = _as_dataframe(channel_meta)
+    units = units[units["area"].str.lower().str.contains("hipp")]
+    channels = channels[channels["chan_id"].isin(theta_phase.keys())]
+    if hemisphere_only and "hemisphere" not in channels.columns:
+        channels["hemisphere"] = "unknown"
+    if units.empty or channels.empty:
+        return pd.DataFrame(columns=["pair_id", "unit_id", "chan_id", "hemisphere"])
+
+    pairs = []
+    for unit in units.itertuples():
+        unit_hemi = getattr(unit, "hemisphere", "unknown")
+        for ch in channels.itertuples():
+            chan_hemi = getattr(ch, "hemisphere", "unknown")
+            if hemisphere_only and unit_hemi != "unknown" and chan_hemi != "unknown" and unit_hemi != chan_hemi:
+                continue
+            pair_id = f"unit{unit.unit_id}_chan{ch.chan_id}"
+            pairs.append(
+                {
+                    "pair_id": pair_id,
+                    "unit_id": unit.unit_id,
+                    "unit_channel": getattr(unit, "channel_id", None),
+                    "unit_area": unit.area,
+                    "unit_hemisphere": unit_hemi,
+                    "chan_id": ch.chan_id,
+                    "chan_area": ch.area,
+                    "chan_hemisphere": chan_hemi,
+                }
+            )
+
+    return pd.DataFrame(pairs)
+
+
+def compute_spike_field_coherence(
+    *,
+    pair_table: pd.DataFrame,
+    trial_table: pd.DataFrame,
+    spike_times_by_unit: Mapping[int, np.ndarray],
+    theta_phase: Mapping[int, np.ndarray],
+    lfp_fs: float,
+    lfp_start_time: float,
+    epoch_extract: Tuple[float, float],
+    epoch_analyze: Tuple[float, float],
+    conditions: Sequence[str],
+    min_spikes: int,
+    jitter_ms: float,
+    n_surrogates: int,
+    repeats_eq: int = 200,
+    rng_seed: int | None = None,
+) -> pd.DataFrame:
+    """Compute vmPFC-theta spike-field coherence per pair/condition and return a flat table."""
+    if pair_table is None or len(pair_table) == 0:
+        return _empty_sfc_results()
+
+    pairs_df = _as_dataframe(pair_table).copy()
+    if "hipp_chan_id" not in pairs_df.columns:
+        if "unit_channel" in pairs_df.columns:
+            pairs_df["hipp_chan_id"] = pairs_df["unit_channel"]
+        elif "unit_id" in pairs_df.columns:
+            pairs_df["hipp_chan_id"] = pairs_df["unit_id"]
+        else:
+            raise ValueError("pair_table must include 'hipp_chan_id' (or 'unit_channel' / 'unit_id').")
+    if "chan_id" not in pairs_df.columns:
+        if "vm_chan_id" in pairs_df.columns:
+            pairs_df["chan_id"] = pairs_df["vm_chan_id"]
+        else:
+            raise ValueError("pair_table must include 'chan_id' (vmPFC reference channel).")
+    if "pair_id" not in pairs_df.columns:
+        pairs_df["pair_id"] = [
+            f"hipp{hip}_vm{vm}" for hip, vm in zip(pairs_df["hipp_chan_id"], pairs_df["chan_id"])
+        ]
+    trials_df = _as_dataframe(trial_table)
+    trials_df = trials_df[trials_df["condition_label"].isin(conditions)]
+    theta_channels = theta_phase.keys()
+
+    rng = _get_rng(rng_seed)
+    summary_rows = []
+    per_pair = {}
+    jitter_width = jitter_ms / 1000.0
+
+    for pair in pairs_df.itertuples():
+        if pair.chan_id not in theta_channels or pair.unit_id not in spike_times_by_unit:
+            continue
+
+        phase_by_cond = {cond: [] for cond in conditions}
+        trial_records = {cond: [] for cond in conditions}
+
+        for cond in conditions:
+            cond_trials = trials_df[trials_df["condition_label"] == cond]
+            if cond_trials.empty:
+                continue
+
+            for trial in cond_trials.itertuples():
+                # Prefer epoch_onset_time, fallback to maint_onset_time for backward compatibility
+                epoch_onset = getattr(trial, "epoch_onset_time", None)
+                if epoch_onset is None:
+                    epoch_onset = getattr(trial, "maint_onset_time", np.nan)
+                if np.isnan(epoch_onset):
+                    continue
+
+                analyze_start = epoch_onset + epoch_analyze[0]
+                analyze_end = epoch_onset + epoch_analyze[1]
+                spikes = _to_numpy(spike_times_by_unit[pair.unit_id])
+                spike_mask = (spikes >= analyze_start) & (spikes <= analyze_end)
+                spikes_in_window = spikes[spike_mask]
+                if spikes_in_window.size == 0:
+                    continue
+
+                extract_start = epoch_onset + epoch_extract[0]
+                extract_end = epoch_onset + epoch_extract[1]
+                start_idx = int(max(0, np.floor((extract_start - lfp_start_time) * lfp_fs)))
+                end_idx = int(min(len(theta_phase[pair.chan_id]), np.ceil((extract_end - lfp_start_time) * lfp_fs)))
+                if end_idx <= start_idx:
+                    continue
+
+                phase_segment = theta_phase[pair.chan_id][start_idx:end_idx]
+                seg_t0 = lfp_start_time + start_idx / lfp_fs
+                phases = sample_phase_at_spikes(phase_segment, lfp_fs, seg_t0, spikes_in_window)
+                if phases.size == 0:
+                    continue
+
+                phase_by_cond[cond].append(phases)
+                trial_records[cond].append(
+                    {
+                        "spikes": spikes_in_window,
+                        "win_start": analyze_start,
+                        "win_end": analyze_end,
+                        "phase_segment": phase_segment,
+                        "segment_t0": seg_t0,
+                    }
+                )
+
+        phase_lists = {cond: np.concatenate(vals) if len(vals) else np.array([]) for cond, vals in phase_by_cond.items()}
+        phase_counts = {cond: arr.size for cond, arr in phase_lists.items()}
+        if any(count == 0 for count in phase_counts.values()):
+            continue
+
+        equalized_mvls, min_count = equalize_spike_counts(phase_lists, repeats=repeats_eq, rng=rng)
+        if min_count < min_spikes:
+            continue
+
+        per_pair[pair.pair_id] = {
+            "phase_lists": phase_lists,
+            "jitter": {},
+            "meta": {"unit_id": pair.unit_id, "chan_id": pair.chan_id},
+        }
+
+        for cond in conditions:
+            phases_flat = phase_lists[cond]
+            if phases_flat.size == 0:
+                continue
+
+            jitter_sets = []
+            if n_surrogates > 0:
+                cond_records = trial_records[cond]
+                if cond_records:
+                    for _ in range(n_surrogates):
+                        surrogate_phases = []
+                        for record in cond_records:
+                            jittered = jitter_spikes_within_trial(
+                                record["spikes"],
+                                record["win_start"],
+                                record["win_end"],
+                                jitter_width=jitter_width,
+                                rng=rng,
+                            )
+                            if jittered.size == 0:
+                                continue
+                            surrogate = sample_phase_at_spikes(
+                                record["phase_segment"],
+                                lfp_fs,
+                                record["segment_t0"],
+                                jittered,
+                            )
+                            if surrogate.size:
+                                surrogate_phases.append(surrogate)
+                        if surrogate_phases:
+                            jitter_sets.append(np.concatenate(surrogate_phases))
+
+            per_pair[pair.pair_id]["jitter"][cond] = jitter_sets
+            z_value = sfc_zscore(phases_flat, jitter_sets)
+
+            summary_rows.append(
+                {
+                    "pair_id": pair.pair_id,
+                    "unit_id": pair.unit_id,
+                    "chan_id": pair.chan_id,
+                    "condition": cond,
+                    "n_spikes": phases_flat.size,
+                    "min_spike_count": min_count,
+                    "equalized_mvl": equalized_mvls.get(cond, np.nan),
+                    "z_sfc_theta": z_value,
+                }
+            )
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.attrs["per_pair"] = per_pair
+    return summary_df
+
+
+def _empty_sfc_results() -> pd.DataFrame:
+    """Empty SFC results table that preserves the expected columns/attrs."""
+    columns = [
+        "pair_id",
+        "unit_id",
+        "chan_id",
+        "condition",
+        "n_spikes",
+        "min_spike_count",
+        "equalized_mvl",
+        "z_sfc_theta",
+    ]
+    df = pd.DataFrame(columns=columns)
+    df.attrs["per_pair"] = {}
+    return df
+
+
+def _seq_to_tuple(seq: Sequence[float] | None) -> tuple[float, ...] | None:
+    if seq is None:
+        return None
+    return tuple(float(val) for val in seq)
+
+
+def _empty_pac_results(
+    *,
+    conditions: Sequence[str],
+    lag_grid_s: Sequence[float] | None,
+    phase_band: Tuple[float, float] | None = None,
+    amp_band: Tuple[float, float] | None = None,
+    phase_band_label: str | None = None,
+    amp_band_label: str | None = None,
+    epoch_label: str | None = None,
+    epoch_window: Tuple[float, float] | None = None,
+) -> pd.DataFrame:
+    """Return an empty ir-PAC results DataFrame (flat, no nested attrs)."""
+    lag_grid_tuple = _seq_to_tuple(lag_grid_s)
+    lag_column_names = []
+    if lag_grid_tuple is not None:
+        lag_column_names = [f"lag_curve_{idx}" for idx, _ in enumerate(lag_grid_tuple)]
+
+    columns = [
+        "pair_id",
+        "unit_id",
+        "hipp_chan_id",
+        "vm_chan_id",
+        "condition",
+        "phase_band_label",
+        "phase_band_lo_hz",
+        "phase_band_hi_hz",
+        "amp_band_label",
+        "amp_band_lo_hz",
+        "amp_band_hi_hz",
+        "epoch_label",
+        "epoch_start_s",
+        "epoch_end_s",
+        "n_trials",
+        "min_trial_count",
+        "raw_pac",
+        "z_pac_theta_gamma",
+        *lag_column_names,
+        "p_pac_theta_gamma",
+        "is_pac_significant",
+        "alpha",
+    ]
+    return pd.DataFrame(columns=columns)
+
+
+def _generate_derangement(n: int, rng) -> np.ndarray:
+    """Generate a random derangement (permutation with no fixed points)."""
+    if n < 2:
+        raise ValueError("Derangement requires at least 2 elements")
+
+    # Start with a random permutation
+    perm = rng.permutation(n)
+
+    # Fix any fixed points
+    for i in range(n):
+        if perm[i] == i:
+            # Find a position j where perm[j] != j and perm[j] != i
+            for j in range(i + 1, n):
+                if perm[j] != j and perm[j] != i:
+                    perm[i], perm[j] = perm[j], perm[i]
+                    break
+            else:
+                # If we can't find such a j, swap with any j > i where perm[j] != i
+                for j in range(i + 1, n):
+                    if perm[j] != i:
+                        perm[i], perm[j] = perm[j], perm[i]
+                        break
+
+    return perm
+
+
+def compute_irpac(
+    *,
+    pair_table: pd.DataFrame,
+    trial_table: pd.DataFrame,
+    theta_phase: Mapping[int, list],
+    gamma_envelope: Mapping[int, list],
+    lfp_fs: float,
+    epoch_analyze: Tuple[float, float],
+    conditions: Sequence[str],
+    min_trials: int,
+    n_surrogates: int,
+    lag_grid_s: Sequence[float] | None = None,
+    exclude_lag_s: Tuple[float, float] | None = None,
+    significance_alpha: float = 0.05,
+    rng_seed: int | None = None,
+    phase_band: Tuple[float, float] | None = None,
+    amp_band: Tuple[float, float] | None = None,
+    phase_band_label: str | None = None,
+    amp_band_label: str | None = None,
+    epoch_label: str | None = None,
+) -> pd.DataFrame:
+    """Compute hippocampal gamma ↔ vmPFC theta ir-PAC per pair/condition.
+
+    Parameters
+    ----------
+    theta_phase : Mapping[int, list]
+        Per-trial phase segments. Format: {chan_id: [(trial_id, phase_segment), ...]}
+    gamma_envelope : Mapping[int, list]
+        Per-trial amplitude segments. Format: {chan_id: [(trial_id, amp_segment), ...]}
+
+    Returns
+    -------
+    pd.DataFrame
+        Flat table with one row per (pair_id, condition) containing:
+        pair_id, unit_id, hipp_chan_id, vm_chan_id, condition, trial counts,
+        raw PAC, z/p-values, significance flag, and optional lag-curve
+        samples flattened into scalar columns named lag_curve_<idx>.
+        All metadata (phase_band, amp_band, epoch) is included as columns.
+        No nested structures or attrs.
+    """
+    def _normalize_band(band: Tuple[float, float] | None):
+        if band is None:
+            return None
+        return (float(band[0]), float(band[1]))
+
+    phase_band = _normalize_band(phase_band)
+    amp_band = _normalize_band(amp_band)
+    phase_band_label = phase_band_label or (f"{phase_band[0]:g}-{phase_band[1]:g}Hz" if phase_band else None)
+    amp_band_label = amp_band_label or (f"{amp_band[0]:g}-{amp_band[1]:g}Hz" if amp_band else None)
+    epoch_start = float(epoch_analyze[0]) if epoch_analyze is not None else np.nan
+    epoch_end = float(epoch_analyze[1]) if epoch_analyze is not None else np.nan
+    epoch_window = (epoch_start, epoch_end) if not np.isnan(epoch_start) and not np.isnan(epoch_end) else None
+    epoch_label = epoch_label or (f"{epoch_start:.3g}–{epoch_end:.3g}s" if epoch_window else None)
+    phase_lo = phase_band[0] if phase_band else np.nan
+    phase_hi = phase_band[1] if phase_band else np.nan
+    amp_lo = amp_band[0] if amp_band else np.nan
+    amp_hi = amp_band[1] if amp_band else np.nan
+    analysis_meta = {
+        "phase_band": phase_band,
+        "phase_band_label": phase_band_label,
+        "amp_band": amp_band,
+        "amp_band_label": amp_band_label,
+        "epoch_label": epoch_label,
+        "epoch_window": epoch_window,
+    }
+    lag_grid_s = _seq_to_tuple(lag_grid_s)
+    lag_column_names = tuple(f"lag_curve_{idx}" for idx in range(len(lag_grid_s))) if lag_grid_s is not None else tuple()
+    if pair_table is None or len(pair_table) == 0:
+        return _empty_pac_results(
+            conditions=conditions,
+            lag_grid_s=lag_grid_s,
+            phase_band=phase_band,
+            amp_band=amp_band,
+            phase_band_label=phase_band_label,
+            amp_band_label=amp_band_label,
+            epoch_label=epoch_label,
+            epoch_window=epoch_window,
+        )
+
+    pairs_df = _as_dataframe(pair_table)
+    trials_df = _as_dataframe(trial_table)
+    trials_df = trials_df[trials_df["condition_label"].isin(conditions)]
+
+    rng = _get_rng(rng_seed)
+    summary_rows = []
+
+    lag_samples = None
+    if lag_grid_s is not None:
+        lag_samples = np.array([int(round(sec * lfp_fs)) for sec in lag_grid_s], dtype=int)
+
+    for pair in pairs_df.itertuples():
+        vm_chan = getattr(pair, "chan_id", None)
+        hipp_chan = getattr(pair, "hipp_chan_id", None)
+        unit_id = getattr(pair, "unit_id", hipp_chan)
+        if vm_chan not in theta_phase or hipp_chan not in gamma_envelope:
+            continue
+
+        # theta_phase and gamma_envelope now contain per-trial segments
+        # Format: {chan_id: [(trial_id, segment), ...]}
+        phase_trials = theta_phase[vm_chan]
+        amp_trials = gamma_envelope[hipp_chan]
+
+        # Build lookup dictionaries: trial_id -> segment
+        phase_by_trial = {trial_id: seg for trial_id, seg in phase_trials}
+        amp_by_trial = {trial_id: seg for trial_id, seg in amp_trials}
+
+        trial_segments = {cond: [] for cond in conditions}
+
+        for cond in conditions:
+            cond_trials = trials_df[trials_df["condition_label"] == cond]
+            if cond_trials.empty:
+                continue
+            for trial in cond_trials.itertuples():
+                trial_id = getattr(trial, "id", getattr(trial, "trial_id", trial.Index))
+
+                # Look up pre-computed segments by trial_id
+                if trial_id not in phase_by_trial or trial_id not in amp_by_trial:
+                    continue
+
+                phase_segment = phase_by_trial[trial_id]
+                amp_segment = amp_by_trial[trial_id]
+
+                # Ensure segments have matching lengths
+                length = min(len(phase_segment), len(amp_segment))
+                if length == 0:
+                    continue
+                phase_segment = phase_segment[:length]
+                amp_segment = amp_segment[:length]
+                trial_segments[cond].append((phase_segment, amp_segment))
+
+        # Require data for all conditions
+        counts = {cond: len(segments) for cond, segments in trial_segments.items()}
+        if any(count == 0 for count in counts.values()):
+            continue
+
+        min_count = min(counts.values())
+        if min_count < min_trials:
+            continue
+
+        for idx, cond in enumerate(conditions):
+            segments = trial_segments[cond]
+            if not segments:
+                continue
+            phase_concat = np.concatenate([seg[0] for seg in segments])
+            amp_concat = np.concatenate([seg[1] for seg in segments])
+            obs = pac_tort_mi(phase_concat, amp_concat)  # Tort's MI from concatenated trials
+
+            # Trial-shuffle surrogates
+            surrogate_values = []
+            if n_surrogates > 0 and len(segments) > 1:
+                phase_segments = [seg[0] for seg in segments]
+                amp_segments = [seg[1] for seg in segments]
+                for _ in range(n_surrogates):
+                    permuted = _generate_derangement(len(amp_segments), rng)
+                    shuffled_amp_segments = [amp_segments[i] for i in permuted]
+                    shuffled_amp = []
+                    shuffled_phase = []
+                    for phase_seg, amp_seg in zip(phase_segments, shuffled_amp_segments):
+                        length = min(len(phase_seg), len(amp_seg))
+                        if length == 0:
+                            continue
+                        shuffled_phase.append(phase_seg[:length])
+                        shuffled_amp.append(amp_seg[:length])
+                    if shuffled_phase and shuffled_amp:
+                        surrogate_values.append(
+                            pac_tort_mi(np.concatenate(shuffled_phase), np.concatenate(shuffled_amp))
+                        )
+
+            z_value = pac_trialshuffle_zscore(obs, surrogate_values)
+            p_value = pac_surrogate_pvalue(obs, surrogate_values, tail="greater")
+            is_significant = bool(not np.isnan(z_value) and z_value >= 1.64)
+
+            lag_curve = None
+            if lag_samples is not None:
+                lag_curve = []
+                for lag_idx, lag in enumerate(lag_samples):
+                    if lag == 0:
+                        phase_shifted = phase_concat
+                        amp_shifted = amp_concat
+                    elif lag > 0:
+                        phase_shifted = phase_concat[lag:]
+                        amp_shifted = amp_concat[:-lag]
+                    else:
+                        phase_shifted = phase_concat[:lag]
+                        amp_shifted = amp_concat[-lag:]
+                    if len(phase_shifted) == 0 or len(amp_shifted) == 0:
+                        lag_curve.append(np.nan)
+                    else:
+                        lag_curve.append(pac_tort_mi(phase_shifted, amp_shifted))
+                lag_curve = np.array(lag_curve)
+                if exclude_lag_s and lag_grid_s is not None:
+                    excl_low, excl_high = sorted(exclude_lag_s)
+                    mask = (np.abs(np.array(lag_grid_s)) >= excl_low) & (np.abs(np.array(lag_grid_s)) <= excl_high)
+                    lag_curve = np.where(mask, np.nan, lag_curve)
+
+            lag_curve_columns = {}
+            if lag_column_names:
+                for idx, col_name in enumerate(lag_column_names):
+                    if lag_curve is not None and idx < len(lag_curve):
+                        value = float(lag_curve[idx])
+                    else:
+                        value = np.nan
+                    lag_curve_columns[col_name] = value
+
+            summary_rows.append(
+                {
+                    "pair_id": pair.pair_id,
+                    "unit_id": unit_id,
+                    "hipp_chan_id": hipp_chan,
+                    "vm_chan_id": vm_chan,
+                    "condition": cond,
+                    "phase_band_label": phase_band_label,
+                    "phase_band_lo_hz": phase_lo,
+                    "phase_band_hi_hz": phase_hi,
+                    "amp_band_label": amp_band_label,
+                    "amp_band_lo_hz": amp_lo,
+                    "amp_band_hi_hz": amp_hi,
+                    "epoch_label": epoch_label,
+                    "epoch_start_s": epoch_start,
+                    "epoch_end_s": epoch_end,
+                    "n_trials": len(segments),
+                    "min_trial_count": min_count,
+                    "raw_pac": obs,
+                    "z_pac_theta_gamma": z_value,
+                    **lag_curve_columns,
+                    "p_pac_theta_gamma": p_value,
+                    "is_pac_significant": is_significant,
+                    "alpha": significance_alpha,
+                }
+            )
+
+    return pd.DataFrame(summary_rows)
+
+
+def run_session_stats(
+    *,
+    sfc_results: pd.DataFrame | None,
+    pac_results: pd.DataFrame | None,
+    conditions: Sequence[str],
+) -> dict:
+    """Summarize pair-level metrics into session-level tests."""
+    if len(conditions) != 2:
+        raise ValueError("run_session_stats currently expects exactly two conditions.")
+    cond_a, cond_b = conditions
+
+    stats = {}
+    for label, results_df, value_col in [
+        ("sfc_theta", sfc_results, "z_sfc_theta"),
+        ("pac_theta_gamma", pac_results, "z_pac_theta_gamma"),
+    ]:
+        df = results_df if isinstance(results_df, pd.DataFrame) else None
+        if df is None or df.empty:
+            stats[label] = None
+            continue
+        pivot = df.pivot_table(index="pair_id", columns="condition", values=value_col)
+        if cond_a not in pivot.columns or cond_b not in pivot.columns:
+            stats[label] = None
+            continue
+        pivot = pivot.dropna(subset=[cond_a, cond_b])
+        if len(pivot) == 0:
+            stats[label] = None
+            continue
+        delta = pivot[cond_b] - pivot[cond_a]
+        n_pairs = len(delta)
+        if np.allclose(delta, 0):
+            statistic, p_value = 0.0, 1.0
+        else:
+            try:
+                statistic, p_value = wilcoxon(delta)
+            except ValueError:
+                statistic, p_value = 0.0, 1.0
+        expected = n_pairs * (n_pairs + 1) / 4.0
+        variance = n_pairs * (n_pairs + 1) * (2 * n_pairs + 1) / 24.0
+        std = np.sqrt(variance) if variance > 0 else 1.0
+        z_value = (statistic - expected) / std if std > 0 else 0.0
+        effect_size = z_value / np.sqrt(n_pairs) if n_pairs > 0 else np.nan
+        ci_low, ci_high = _bca_ci(delta.values, statistic=np.median)
+        stats[label] = {
+            "n_pairs": n_pairs,
+            "median_a": float(np.median(pivot[cond_a])),
+            "median_b": float(np.median(pivot[cond_b])),
+            "median_delta": float(np.median(delta)),
+            "iqr_a": (float(np.percentile(pivot[cond_a], 25)), float(np.percentile(pivot[cond_a], 75))),
+            "iqr_b": (float(np.percentile(pivot[cond_b], 25)), float(np.percentile(pivot[cond_b], 75))),
+            "p_value": float(p_value),
+            "effect_size_r": float(effect_size),
+            "delta_ci95": (ci_low, ci_high),
+            "wilcoxon_stat": float(statistic),
+            "wilcoxon_z": float(z_value),
+        }
+
+    return stats
+
+
+def plot_session_summary(
+    *,
+    sfc_results: pd.DataFrame | None,
+    pac_results: pd.DataFrame | None,
+    stats_summary: dict,
+    conditions: Sequence[str],
+    output_dir: str | Path,
+    dpi: int = 150,
+) -> list[Path]:
+    """Generate session-level summary plots for SFC and PAC metrics."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plots = []
+    config = [
+        ("sfc", sfc_results, "z_sfc_theta", "SFC θ z-score"),
+        ("pac", pac_results, "z_pac_theta_gamma", "ir-PAC θ×γ z-score"),
+    ]
+
+    for key, result_df, value_col, title in config:
+        df = result_df if isinstance(result_df, pd.DataFrame) else None
+        if df is None or df.empty:
+            continue
+        pivot = df.pivot_table(index="pair_id", columns="condition", values=value_col)
+        if any(cond not in pivot.columns for cond in conditions):
+            continue
+        pivot = pivot.dropna(subset=conditions)
+        if pivot.empty:
+            continue
+        cond_a, cond_b = conditions
+        delta = pivot[cond_b] - pivot[cond_a]
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+        for _, row in pivot.iterrows():
+            axes[0].plot(conditions, [row[cond_a], row[cond_b]], color="0.7", alpha=0.6)
+        axes[0].scatter(
+            [cond_a] * len(pivot),
+            pivot[cond_a],
+            color="#1f77b4",
+            label=cond_a,
+        )
+        axes[0].scatter(
+            [cond_b] * len(pivot),
+            pivot[cond_b],
+            color="#ff7f0e",
+            label=cond_b,
+        )
+        axes[0].set_title(f"{title}: paired values")
+        axes[0].set_ylabel(value_col)
+        axes[0].legend()
+
+        sns.violinplot(y=delta, ax=axes[1], color="#c5c9e5", inner="box")
+        axes[1].axhline(0, color="k", linestyle="--", linewidth=1)
+        axes[1].set_title(f"{title}: Δ({cond_b}−{cond_a})")
+        axes[1].set_ylabel("Delta")
+
+        stats = stats_summary.get("sfc_theta" if key == "sfc" else "pac_theta_gamma") if stats_summary else None
+        if stats:
+            axes[1].text(
+                0.05,
+                0.95,
+                f"n={stats['n_pairs']}\np={stats['p_value']:.3g}\nmedian Δ={stats['median_delta']:.2f}",
+                transform=axes[1].transAxes,
+                va="top",
+            )
+
+        fig.suptitle(title)
+        fig.tight_layout()
+        out_path = output_dir / f"{key}_session_summary.png"
+        fig.savefig(out_path, dpi=dpi)
+        plt.close(fig)
+        plots.append(out_path)
+
+    return plots
+
+
+def write_pac_presence_to_nwb(
+    *,
+    session_path: str | Path,
+    pac_presence: pd.DataFrame,
+    module_name: str = "irpac",
+    table_name: str = "pac_presence",
+) -> Path | None:
+    """Store per-pair PAC presence metrics inside the NWB processing module."""
+    if pac_presence is None or pac_presence.empty:
+        return None
+    session_path = Path(session_path)
+    if not session_path.exists():
+        raise FileNotFoundError(session_path)
+
+    io = NWBHDF5IO(str(session_path), "r+")
+    nwbfile = io.read()
+    try:
+        if module_name in nwbfile.processing:
+            module = nwbfile.processing[module_name]
+        else:
+            module = nwbfile.create_processing_module(
+                name=module_name,
+                description="Cross-frequency coupling analysis outputs (ir-PAC).",
+            )
+        if table_name in module.data_interfaces:
+            del module.data_interfaces[table_name]
+
+        table = DynamicTable(
+            name=table_name,
+            description="Per-pair hippocampus↔vmPFC ir-PAC presence metrics (all trials).",
+        )
+        for column in pac_presence.columns:
+            table.add_column(name=column, description=f"{column} (ir-PAC metric)")
+
+        for _, row in pac_presence.iterrows():
+            clean_row = {}
+            for key, value in row.items():
+                if isinstance(value, np.generic):
+                    clean_row[key] = value.item()
+                elif pd.isna(value):
+                    clean_row[key] = np.nan
+                else:
+                    clean_row[key] = value
+            table.add_row(**clean_row)
+
+        module.add_data_interface(table)
+        io.write(nwbfile)
+    finally:
+        io.close()
+    return session_path
+
+
+def save_session_outputs(
+    *,
+    session_id: str,
+    output_dir: str | Path,
+    session_path: str | Path | None = None,
+    pair_table: pd.DataFrame | None,
+    sfc_results: pd.DataFrame | None,
+    pac_results: pd.DataFrame | None,
+    pac_presence: pd.DataFrame | None = None,
+    stats_summary: dict | None,
+    analysis_params: dict | None = None,
+) -> dict:
+    """Persist CSV/JSON artifacts for downstream reports."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = {}
+
+    if pair_table is not None and not pair_table.empty:
+        pairs_path = output_dir / f"{session_id}_pairs.csv"
+        pair_table.to_csv(pairs_path, index=False)
+        artifacts["pair_table"] = pairs_path
+
+    sfc_summary = sfc_results if isinstance(sfc_results, pd.DataFrame) else None
+    if sfc_summary is not None and not sfc_summary.empty:
+        sfc_path = output_dir / f"{session_id}_sfc_summary.csv"
+        sfc_summary.to_csv(sfc_path, index=False)
+        artifacts["sfc_summary"] = sfc_path
+
+    pac_summary = pac_results if isinstance(pac_results, pd.DataFrame) else None
+    if pac_summary is not None and not pac_summary.empty:
+        pac_path = output_dir / f"{session_id}_pac_summary.csv"
+        pac_summary.to_csv(pac_path, index=False)
+        artifacts["pac_summary"] = pac_path
+
+    if (
+        session_path is not None
+        and pac_presence is not None
+        and isinstance(pac_presence, pd.DataFrame)
+        and not pac_presence.empty
+    ):
+        try:
+            write_pac_presence_to_nwb(session_path=session_path, pac_presence=pac_presence)
+            artifacts["pac_presence_nwb"] = str(Path(session_path))
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"Failed to store PAC presence in NWB: {exc}")
+
+    summary_payload = {
+        "session_id": session_id,
+        "stats": stats_summary,
+        "analysis_params": analysis_params,
+    }
+    summary_path = output_dir / f"{session_id}_summary.json"
+    summary_path.write_text(json.dumps(summary_payload, indent=2))
+    artifacts["summary_json"] = summary_path
+
+    return artifacts
+
+
+def compute_vmPFC_theta_phase(
+    *,
+    lfp_by_channel: Mapping[int, np.ndarray],
+    channel_meta: pd.DataFrame,
+    trial_table: pd.DataFrame,
+    sampling_rate: float,
+    lfp_start_time: float,
+    epoch_analyze: Tuple[float, float],
+    theta_band: Tuple[float, float],
+    car_mode: str | None = "hemisphere",
+    trial_pad_sec: float = 0.5,
+    filter_order: int = 4,
+    exclude_bad: bool = True,
+    bad_flag_column: str = "bad",
+    max_peak_to_peak: float | None = None,
+) -> Dict[int, list]:
+    """
+    Compute theta-band phase traces for vmPFC channels with per-trial processing.
+
+    Each trial epoch is extracted with padding, filtered, Hilbert-transformed,
+    then trimmed to remove edge artifacts. Returns per-trial segments organized
+    by channel.
+
+    Parameters
+    ----------
+    trial_pad_sec : float, default=0.5
+        Padding in seconds to add before and after each trial epoch before
+        filtering/Hilbert transform. Trimmed after processing to remove edge artifacts.
+
+    Returns
+    -------
+    Dict[int, list]
+        Mapping of chan_id -> list of (trial_id, phase_segment) tuples
+    """
+    df = _as_dataframe(channel_meta)
+    trials_df = _as_dataframe(trial_table)
+    areas = df["area"].fillna("") if "area" in df.columns else pd.Series("", index=df.index)
+    mask = areas.str.lower().str.contains("vmpfc")
+    vm_df = df[mask].copy()
+    if vm_df.empty:
+        return {}
+
+    # Load and validate signals
+    signals = {}
+    valid_chan_ids = []
+    for row in vm_df.itertuples():
+        if exclude_bad and bad_flag_column in vm_df.columns:
+            if bool(getattr(row, bad_flag_column, False)):
+                continue
+        signal = _to_numpy(lfp_by_channel.get(row.chan_id))
+        if signal.size == 0:
+            continue
+        if max_peak_to_peak is not None and np.ptp(signal) > max_peak_to_peak:
+            continue
+        signals[row.chan_id] = signal
+        valid_chan_ids.append(row.chan_id)
+
+    vm_df = vm_df[vm_df["chan_id"].isin(valid_chan_ids)]
+    if vm_df.empty:
+        return {}
+
+    # Apply CAR to full continuous signals first
+    if car_mode in {"region", "hemisphere"}:
+        if car_mode == "region":
+            group_key = vm_df["area"].fillna("vmPFC")
+        else:
+            group_key = vm_df["hemisphere"].fillna("unknown") if "hemisphere" in vm_df.columns else pd.Series("unknown", index=vm_df.index)
+        for group_val in group_key.dropna().unique():
+            group_ids = vm_df[group_key == group_val]["chan_id"].tolist()
+            if len(group_ids) < 2:
+                continue
+            stack = np.vstack([signals[cid] for cid in group_ids])
+            group_mean = np.mean(stack, axis=0)
+            for cid in group_ids:
+                signals[cid] = signals[cid] - group_mean
+
+    # Per-trial processing: segment → pad → filter → Hilbert → trim
+    phase_dict = {chan_id: [] for chan_id in signals.keys()}
+    pad_samples = int(trial_pad_sec * sampling_rate)
+
+    for trial in trials_df.itertuples():
+        trial_id = getattr(trial, "id", getattr(trial, "trial_id", trial.Index))
+        # Prefer epoch_onset_time, fallback to maint_onset_time for backward compatibility
+        epoch_onset = getattr(trial, "epoch_onset_time", None)
+        if epoch_onset is None:
+            epoch_onset = getattr(trial, "maint_onset_time", np.nan)
+        if np.isnan(epoch_onset):
+            continue
+
+        # Calculate trial epoch with padding
+        epoch_start = epoch_onset + epoch_analyze[0]
+        epoch_end = epoch_onset + epoch_analyze[1]
+        padded_start = epoch_start - trial_pad_sec
+        padded_end = epoch_end + trial_pad_sec
+
+        # Convert to sample indices
+        start_idx = int(max(0, np.floor((padded_start - lfp_start_time) * sampling_rate)))
+        end_idx = int(np.ceil((padded_end - lfp_start_time) * sampling_rate))
+
+        for chan_id, signal in signals.items():
+            if end_idx > len(signal):
+                end_idx = len(signal)
+            if end_idx <= start_idx:
+                continue
+
+            # Extract padded segment
+            trial_segment = signal[start_idx:end_idx]
+            if len(trial_segment) == 0:
+                continue
+
+            # Filter and Hilbert transform
+            filtered = bandpass_filtfilt(trial_segment, sampling_rate, theta_band, order=filter_order)
+            analytic = hilbert(filtered)
+            phase = np.angle(analytic)
+
+            # Trim padding from both ends
+            trim_samples = pad_samples
+            if len(phase) <= 2 * trim_samples:
+                # If segment is too short after padding, skip
+                continue
+            phase_trimmed = phase[trim_samples:-trim_samples]
+
+            phase_dict[chan_id].append((trial_id, phase_trimmed))
+
+    return phase_dict
+
+
+def compute_hipp_gamma_envelope(
+    *,
+    lfp_by_channel: Mapping[int, np.ndarray],
+    channel_meta: pd.DataFrame,
+    trial_table: pd.DataFrame,
+    sampling_rate: float,
+    lfp_start_time: float,
+    epoch_analyze: Tuple[float, float],
+    gamma_band: Tuple[float, float],
+    trial_pad_sec: float = 0.5,
+    filter_order: int = 4,
+    exclude_bad: bool = True,
+    bad_flag_column: str = "bad",
+    max_peak_to_peak: float | None = None,
+) -> Dict[int, list]:
+    """
+    Compute hippocampal gamma-band amplitude envelopes with per-trial processing.
+
+    Each trial epoch is extracted with padding, filtered, Hilbert-transformed,
+    then trimmed to remove edge artifacts. Returns per-trial segments organized
+    by channel.
+
+    Parameters
+    ----------
+    trial_pad_sec : float, default=0.5
+        Padding in seconds to add before and after each trial epoch before
+        filtering/Hilbert transform. Trimmed after processing to remove edge artifacts.
+
+    Returns
+    -------
+    Dict[int, list]
+        Mapping of chan_id -> list of (trial_id, amplitude_segment) tuples
+    """
+    df = _as_dataframe(channel_meta)
+    trials_df = _as_dataframe(trial_table)
+    areas = df["area"].fillna("")
+    mask = areas.str.lower().str.contains("hipp")
+    hipp_df = df[mask].copy()
+    if hipp_df.empty:
+        return {}
+
+    # Load and validate signals
+    signals = {}
+    valid_chan_ids = []
+    for row in hipp_df.itertuples():
+        if exclude_bad and bad_flag_column in hipp_df.columns:
+            if bool(getattr(row, bad_flag_column, False)):
+                continue
+        signal = _to_numpy(lfp_by_channel.get(row.chan_id))
+        if signal.size == 0:
+            continue
+        if max_peak_to_peak is not None and np.ptp(signal) > max_peak_to_peak:
+            continue
+        signals[row.chan_id] = signal
+        valid_chan_ids.append(row.chan_id)
+
+    if not signals:
+        return {}
+
+    # Per-trial processing: segment → pad → filter → Hilbert → trim
+    amp_dict = {chan_id: [] for chan_id in signals.keys()}
+    pad_samples = int(trial_pad_sec * sampling_rate)
+
+    for trial in trials_df.itertuples():
+        trial_id = getattr(trial, "id", getattr(trial, "trial_id", trial.Index))
+        # Prefer epoch_onset_time, fallback to maint_onset_time for backward compatibility
+        epoch_onset = getattr(trial, "epoch_onset_time", None)
+        if epoch_onset is None:
+            epoch_onset = getattr(trial, "maint_onset_time", np.nan)
+        if np.isnan(epoch_onset):
+            continue
+
+        # Calculate trial epoch with padding
+        epoch_start = epoch_onset + epoch_analyze[0]
+        epoch_end = epoch_onset + epoch_analyze[1]
+        padded_start = epoch_start - trial_pad_sec
+        padded_end = epoch_end + trial_pad_sec
+
+        # Convert to sample indices
+        start_idx = int(max(0, np.floor((padded_start - lfp_start_time) * sampling_rate)))
+        end_idx = int(np.ceil((padded_end - lfp_start_time) * sampling_rate))
+
+        for chan_id, signal in signals.items():
+            if end_idx > len(signal):
+                end_idx = len(signal)
+            if end_idx <= start_idx:
+                continue
+
+            # Extract padded segment
+            trial_segment = signal[start_idx:end_idx]
+            if len(trial_segment) == 0:
+                continue
+
+            # Filter and Hilbert transform
+            filtered = bandpass_filtfilt(trial_segment, sampling_rate, gamma_band, order=filter_order)
+            analytic = hilbert(filtered)
+            amp = np.abs(analytic)
+
+            # Trim padding from both ends
+            trim_samples = pad_samples
+            if len(amp) <= 2 * trim_samples:
+                # If segment is too short after padding, skip
+                continue
+            amp_trimmed = amp[trim_samples:-trim_samples]
+
+            amp_dict[chan_id].append((trial_id, amp_trimmed))
+
+    return amp_dict

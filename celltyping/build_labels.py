@@ -1,9 +1,9 @@
 """Entry point: build the per-unit cell-type label table for a WM dataset.
 
 Run from E:\\SBCAT with the project venv, e.g.:
-    .venv\\Scripts\\python.exe build_labels.py --dataset 000673
-    .venv\\Scripts\\python.exe build_labels.py --dataset 000469 --no-wavemap
-    .venv\\Scripts\\python.exe build_labels.py --dataset both
+    .venv\\Scripts\\python.exe celltyping\\build_labels.py --dataset 000673
+    .venv\\Scripts\\python.exe celltyping\\build_labels.py --dataset 000469 --no-wavemap
+    .venv\\Scripts\\python.exe celltyping\\build_labels.py --dataset both
 
 Writes outputs/celltype/unit_labels_<dataset>.csv and, per dataset, a QC figure.
 Nothing here is auto-run — execute + debug at your own pace.
@@ -22,9 +22,10 @@ from celltyping.labels import build_label_table, save_label_table   # noqa: E402
 from celltyping import viz                                          # noqa: E402
 
 # fs_hz is the OSort 100 kHz convention; verify per dataset (trough_to_peak ~0.2-1.0 ms).
+DATA_DIR = ROOT.parent / "data"   # datasets pooled at repo-root data/
 DATASETS = {
-    "000673": dict(root=ROOT / "000673", glob="sub-*/*.nwb", fs_hz=100_000.0),
-    "000469": dict(root=ROOT / "000469", glob="sub-*/*.nwb", fs_hz=100_000.0),
+    "000673": dict(root=DATA_DIR / "000673", glob="sub-*/*.nwb", fs_hz=100_000.0),
+    "000469": dict(root=DATA_DIR / "000469", glob="sub-*/*.nwb", fs_hz=100_000.0),
 }
 
 

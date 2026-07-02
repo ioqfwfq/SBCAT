@@ -4,6 +4,7 @@
 
 # Analysis outputs
 analysis_output/
+outputs/
 
 # Figures
 figures/

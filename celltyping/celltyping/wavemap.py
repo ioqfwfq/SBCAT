@@ -41,16 +41,13 @@ def _crop_around_trough(w: np.ndarray, pre: int, post: int) -> np.ndarray:
     return seg[: pre + post]
 
 
-def preprocess_waveforms(waveforms, fs_hz: float = OSORT_FS_HZ,
-                         pre_ms: float = 0.6, post_ms: float = 1.2, n_out: int | None = None):
-    """List of polarity-normalized mean waveforms -> WaveMAP input matrix.
+def align_crop_waveforms(waveforms, fs_hz: float = OSORT_FS_HZ,
+                         pre_ms: float = 0.3, post_ms: float = 1.7, n_out: int | None = None):
+    """Trough-align + crop each waveform to a common window (protocol steps 2-4; no normalization).
 
-    Returns (X, valid) where X is (n_valid, L) and `valid` is a boolean mask aligned
-    to the input list (so cluster labels can be mapped back to units).
-
-    Each row: cropped to a common trough-aligned window, optionally resampled to
-    `n_out` samples (use when pooling datasets with different fs), then mean-subtracted
-    and scaled to max |amplitude| = 1.
+    Puts the trough `pre_ms` into the window (protocol: 0.3 ms) and takes `pre_ms+post_ms`
+    (~2.0 ms) around it; optionally resamples to `n_out` samples (for pooling mixed fs).
+    Returns (X_cropped, valid) with `valid` a boolean mask aligned to the input list.
     """
     pre = int(round(pre_ms / 1000.0 * fs_hz))
     post = int(round(post_ms / 1000.0 * fs_hz))
@@ -69,16 +66,34 @@ def preprocess_waveforms(waveforms, fs_hz: float = OSORT_FS_HZ,
     if not rows:
         return np.empty((0, pre + post)), valid
     X = np.vstack(rows)
-
     if n_out and n_out != X.shape[1]:
         from scipy.signal import resample
         X = resample(X, n_out, axis=1)
+    return X, valid
 
+
+def normalize_waveforms(X):
+    """Protocol steps 9-10: mean-subtract each waveform, then divide by its max |amplitude|."""
+    X = np.asarray(X, dtype=float)
+    if X.size == 0:
+        return X
     X = X - X.mean(axis=1, keepdims=True)
     scale = np.max(np.abs(X), axis=1, keepdims=True)
     scale[scale == 0] = 1.0
-    X = X / scale
-    return X, valid
+    return X / scale
+
+
+def preprocess_waveforms(waveforms, fs_hz: float = OSORT_FS_HZ,
+                         pre_ms: float = 0.3, post_ms: float = 1.7, n_out: int | None = None):
+    """Full WaveMAP input pipeline: align_crop_waveforms then normalize_waveforms.
+
+    Returns (X, valid) where X is (n_valid, L) mean-subtracted, max-normalized waveforms
+    and `valid` maps rows back to the input list. Use the two component functions directly
+    if you want to inspect the aligned-but-unnormalized waveforms (e.g. for curation).
+    """
+    X, valid = align_crop_waveforms(waveforms, fs_hz=fs_hz, pre_ms=pre_ms,
+                                    post_ms=post_ms, n_out=n_out)
+    return (normalize_waveforms(X) if X.size else X), valid
 
 
 # ── 2-3. UMAP graph -> Louvain communities ───────────────────────────────────
@@ -103,7 +118,7 @@ def run_wavemap(X, n_neighbors: int = 15, min_dist: float = 0.1, metric: str = "
                                                  random_state=random_state)
     labels = np.array([partition.get(i, -1) for i in range(X.shape[0])], dtype=int)
     return dict(labels=labels, embedding=np.asarray(embedding),
-                graph=reducer.graph_, reducer=reducer)
+                graph=reducer.graph_, reducer=reducer, X=np.asarray(X))
 
 
 # ── 4. interpretation: which waveform samples define the clusters ─────────────
@@ -157,3 +172,179 @@ def check_dataset_confound(labels, dataset):
     tab = pd.crosstab(pd.Series(labels, name="cluster"), pd.Series(dataset, name="dataset"))
     chi2, p, dof, _ = chi2_contingency(tab)
     return dict(table=tab, chi2=float(chi2), p=float(p), dof=int(dof))
+
+
+# ── resolution selection (protocol Fig. 4: modularity vs number of clusters) ──
+def resolution_sweep(X, resolutions=(1.0, 1.5, 2.0, 2.5, 3.0),
+                     n_neighbors: int = 15, min_dist: float = 0.1,
+                     metric: str = "euclidean", random_state: int = 42):
+    """Sweep Louvain resolution on ONE UMAP graph -> DataFrame(resolution, n_clusters, modularity).
+
+    The protocol chooses `resolution` by jointly maximizing modularity while minimizing
+    the number of clusters (Lee et al. 2021, Fig. 4). UMAP is fit once; only Louvain re-runs,
+    so this is cheap. Use it to justify the resolution passed to run_wavemap().
+    """
+    import umap
+    import networkx as nx
+    import community as community_louvain
+    import pandas as pd
+
+    reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=min_dist, metric=metric,
+                        random_state=random_state)
+    reducer.fit(X)
+    G = nx.from_scipy_sparse_array(reducer.graph_)
+    rows = []
+    for r in resolutions:
+        part = community_louvain.best_partition(G, resolution=float(r), random_state=random_state)
+        rows.append(dict(resolution=float(r),
+                         n_clusters=len(set(part.values())),
+                         modularity=float(community_louvain.modularity(part, G))))
+    return pd.DataFrame(rows)
+
+
+# ── batch-effect check: is a cluster dominated by one nuisance-factor level? ──
+def cluster_composition(labels, factor, factor_name: str = "factor"):
+    """Cluster x factor contingency + per-cluster dominance + chi-square.
+
+    Protocol step 18 (CRITICAL) batch-effect check: does a WaveMAP cluster segregate by a
+    nuisance variable (subject, session, region) rather than cell type? `max_frac` is, per
+    cluster, the fraction of its units from the single most common factor level — values
+    near 1 flag a cluster that is likely a batch artifact rather than a real waveform type.
+    Returns dict(table, frac, max_frac, chi2, p, dof).
+    """
+    import pandas as pd
+    from scipy.stats import chi2_contingency
+
+    tab = pd.crosstab(pd.Series(list(labels), name="cluster"),
+                      pd.Series(list(factor), name=factor_name))
+    frac = tab.div(tab.sum(axis=1).replace(0, 1), axis=0)
+    max_frac = frac.max(axis=1)
+    try:
+        chi2, p, dof, _ = chi2_contingency(tab)
+    except ValueError:
+        chi2, p, dof = float("nan"), float("nan"), 0
+    return dict(table=tab, frac=frac, max_frac=max_frac,
+                chi2=float(chi2), p=float(p), dof=int(dof))
+
+
+# ── putative cell-type label per cluster (from median physiology profile) ──
+def label_clusters(profile, split_ms: float, rate_fs_hz: float = 5.0, burst_hi: float = 0.15):
+    """Assign a putative cell-type label to each WaveMAP cluster from its median profile.
+
+    Transparent, tunable rules on the per-cluster medians (from characterize_clusters):
+      * trough_to_peak_ms < split_ms  -> narrow (putative interneuron);
+          mean_rate_hz >= rate_fs_hz  -> "fast-spiking ...", else "narrow-spiking ..."
+      * otherwise                     -> broad (putative pyramidal);
+          burst_index >= burst_hi     -> "broad bursting ...", else "broad regular-spiking ..."
+
+    These are PUTATIVE summaries — the mean waveform, SHAP importances, and physiology
+    profile are the evidence. Triphasic/axonal types are best assigned by eye from the
+    per-cluster mean-waveform grid, then edited here. Returns dict{cluster -> label}.
+    """
+    import numpy as _np
+    labels = {}
+    for cid, row in profile.iterrows():
+        ttp = row.get("trough_to_peak_ms", _np.nan)
+        rate = row.get("mean_rate_hz", _np.nan)
+        burst = row.get("burst_index", _np.nan)
+        if _np.isfinite(ttp) and ttp < split_ms:
+            labels[cid] = ("fast-spiking (putative interneuron)"
+                           if _np.isfinite(rate) and rate >= rate_fs_hz
+                           else "narrow-spiking (putative interneuron)")
+        else:
+            labels[cid] = ("broad bursting (putative pyramidal)"
+                           if _np.isfinite(burst) and burst >= burst_hi
+                           else "broad regular-spiking (putative pyramidal)")
+    return labels
+
+
+# ── parameter tuning: grid over (n_neighbors, resolution) scored on 3 axes ────
+def tune_wavemap(X, n_neighbors_grid=(15, 20, 30, 50),
+                 resolution_grid=(1.0, 1.5, 2.0, 2.5, 3.0), seeds=(1, 2, 3),
+                 feat_df=None, factor=None,
+                 physio_feats=("trough_to_peak_ms", "half_width_ms", "peak_trough_ratio",
+                               "repol_slope", "mean_rate_hz", "isi_cv", "burst_index"),
+                 min_dist: float = 0.1, metric: str = "euclidean", verbose: bool = True):
+    """Score a (n_neighbors x resolution) grid for WaveMAP so params are chosen from evidence.
+
+    WaveMAP is unsupervised, so there is no accuracy to maximize -- the goal is the FEWEST
+    clusters that are stable, well-separated, physiologically distinct, and not batch
+    artifacts. Per grid cell this returns:
+        n_clusters       from the first seed
+        modularity       Louvain modularity (graph-native separation), first seed
+        silhouette       silhouette on the UMAP embedding, first seed (visual separation;
+                         distorted by UMAP, use as a rough proxy)
+        stability_ari    mean pairwise Adjusted Rand Index of labels ACROSS `seeds`
+                         (the key test -- clusters that reshuffle per seed are not real)
+        min_physio_dist  min pairwise distance between clusters' z-scored median-physiology
+                         profiles (near 0 => two clusters are near-duplicates => over-split)
+        max_factor_frac  max over clusters of the single-`factor`-level fraction
+                         (near 1 => a cluster is dominated by one subject/session => batch)
+
+    UMAP is fit once per (n_neighbors, seed); Louvain re-runs per resolution (cheap).
+    Pass feat_df (rows aligned to X) for min_physio_dist and factor (e.g. subject) for
+    max_factor_frac. Returns a DataFrame, one row per grid cell.
+
+    Read it: prefer high stability_ari + decent silhouette/modularity + low max_factor_frac
+    + high min_physio_dist, choosing the SMALLEST n_clusters among cells that tie.
+    """
+    import numpy as np
+    import pandas as pd
+    import umap
+    import networkx as nx
+    import community as community_louvain
+    from sklearn.metrics import adjusted_rand_score, silhouette_score
+    from scipy.spatial.distance import pdist
+
+    X = np.asarray(X)
+    seeds = list(seeds)
+    labels_store, embed_store, mod_store = {}, {}, {}
+    for nn in n_neighbors_grid:
+        for seed in seeds:
+            reducer = umap.UMAP(n_neighbors=int(nn), min_dist=min_dist, metric=metric,
+                                random_state=int(seed))
+            embed_store[(nn, seed)] = np.asarray(reducer.fit_transform(X))
+            G = nx.from_scipy_sparse_array(reducer.graph_)
+            for res in resolution_grid:
+                part = community_louvain.best_partition(G, resolution=float(res),
+                                                        random_state=int(seed))
+                labels_store[(nn, res, seed)] = np.array(
+                    [part.get(i, -1) for i in range(X.shape[0])], dtype=int)
+                mod_store[(nn, res, seed)] = float(community_louvain.modularity(part, G))
+        if verbose:
+            print(f"  n_neighbors={nn}: fit {len(seeds)} seeds x {len(resolution_grid)} resolutions")
+
+    base = seeds[0]
+    feats = [f for f in physio_feats if feat_df is not None and f in feat_df.columns]
+    rows = []
+    for nn in n_neighbors_grid:
+        emb0 = embed_store[(nn, base)]
+        for res in resolution_grid:
+            lab0 = labels_store[(nn, res, base)]
+            k = int(len(set(lab0)))
+            sil = float(silhouette_score(emb0, lab0)) if k > 1 else np.nan
+            aris = [adjusted_rand_score(labels_store[(nn, res, seeds[i])],
+                                        labels_store[(nn, res, seeds[j])])
+                    for i in range(len(seeds)) for j in range(i + 1, len(seeds))]
+            stab = float(np.mean(aris)) if aris else np.nan
+
+            min_phys = np.nan
+            if feats and k > 1:
+                tmp = feat_df[feats].copy()
+                tmp["_c"] = lab0
+                prof = tmp.groupby("_c").median()
+                z = (prof - prof.mean()) / prof.std(ddof=0).replace(0, 1.0)
+                z = z.fillna(0.0)
+                if len(z) > 1:
+                    min_phys = float(pdist(z.to_numpy()).min())
+
+            max_frac = np.nan
+            if factor is not None:
+                comp = cluster_composition(lab0, factor)
+                max_frac = float(comp["max_frac"].max())
+
+            rows.append(dict(n_neighbors=int(nn), resolution=float(res), n_clusters=k,
+                             modularity=mod_store[(nn, res, base)], silhouette=sil,
+                             stability_ari=stab, min_physio_dist=min_phys,
+                             max_factor_frac=max_frac))
+    return pd.DataFrame(rows)

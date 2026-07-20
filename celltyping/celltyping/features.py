@@ -19,6 +19,7 @@ Spike train / autocorrelogram (from the full-session spike times)
     local_variation     Shinomoto Lv
     burst_index         fraction of ISIs < 5 ms
     prop_isi_viol       fraction of ISIs < 2 ms (contamination QC)
+    isi_viol_rate       Hill et al. ISI-violation rate, % (WaveMAP curation metric)
     median_isi_ms       median ISI
     acg_refrac_ms       ACG refractory: first lag reaching 50% of the 20-50 ms plateau
     acg_peak_ms         lag of the ACG mode (short for bursting cells)
@@ -166,9 +167,9 @@ def autocorrelogram(spike_times_s, bin_ms: float = 1.0, win_ms: float = 50.0) ->
 def spike_train_features(spike_times_s, bin_ms: float = 1.0, win_ms: float = 50.0) -> dict:
     """Firing-statistics + ACG-shape features from one unit's full spike train."""
     nan = dict(mean_rate_hz=np.nan, isi_cv=np.nan, isi_cv2=np.nan, local_variation=np.nan,
-               burst_index=np.nan, prop_isi_viol=np.nan, median_isi_ms=np.nan,
-               acg_refrac_ms=np.nan, acg_peak_ms=np.nan, acg_burst_ratio=np.nan,
-               n_spikes=0, st_valid=False)
+               burst_index=np.nan, prop_isi_viol=np.nan, isi_viol_rate=np.nan,
+               median_isi_ms=np.nan, acg_refrac_ms=np.nan, acg_peak_ms=np.nan,
+               acg_burst_ratio=np.nan, n_spikes=0, st_valid=False)
     t = np.sort(np.asarray(spike_times_s, dtype=float))
     t = t[np.isfinite(t)]
     n = t.size
@@ -188,6 +189,13 @@ def spike_train_features(spike_times_s, bin_ms: float = 1.0, win_ms: float = 50.
     burst_index = float(np.mean(isi < 5.0))
     prop_isi_viol = float(np.mean(isi < 2.0))
     median_isi_ms = float(np.median(isi))
+    # Hill et al. ISI-violation rate (WaveMAP curation metric): estimated contamination
+    # as a % of firing rate, refractory threshold 1.5 ms. Informational flag, not a gate.
+    isi_thr_ms = 1.5
+    n_viol = float(np.sum(isi < isi_thr_ms))
+    viol_time_s = 2.0 * n * (isi_thr_ms / 1000.0)
+    isi_viol_rate = (float((n_viol / viol_time_s) / mean_rate * 100.0)
+                     if viol_time_s > 0 and np.isfinite(mean_rate) and mean_rate > 0 else np.nan)
 
     counts, centers = autocorrelogram(t, bin_ms=bin_ms, win_ms=win_ms)
     pos = centers > 0
@@ -205,9 +213,10 @@ def spike_train_features(spike_times_s, bin_ms: float = 1.0, win_ms: float = 50.
 
     return dict(mean_rate_hz=float(mean_rate), isi_cv=isi_cv, isi_cv2=isi_cv2,
                 local_variation=local_variation, burst_index=burst_index,
-                prop_isi_viol=prop_isi_viol, median_isi_ms=median_isi_ms,
-                acg_refrac_ms=acg_refrac_ms, acg_peak_ms=acg_peak_ms,
-                acg_burst_ratio=acg_burst_ratio, n_spikes=int(n), st_valid=True)
+                prop_isi_viol=prop_isi_viol, isi_viol_rate=isi_viol_rate,
+                median_isi_ms=median_isi_ms, acg_refrac_ms=acg_refrac_ms,
+                acg_peak_ms=acg_peak_ms, acg_burst_ratio=acg_burst_ratio,
+                n_spikes=int(n), st_valid=True)
 
 
 # ── NWB unit iteration -> per-unit feature table ─────────────────────────────
@@ -233,7 +242,10 @@ def _unit_location(unit_idx, units_df, electrodes_df):
 
 def build_unit_features(nwb_files, fs_hz: float = OSORT_FS_HZ,
                         wf_col_priority=("waveform_mean", "waveforms"),
+                        areas=None,
                         return_waveforms: bool = False,
+                        return_spike_times: bool = False,
+                        waveform_kind: str = "normalized",
                         verbose: bool = True):
     """One row per unit across all NWB files: identity + waveform + spike features.
 
@@ -242,11 +254,31 @@ def build_unit_features(nwb_files, fs_hz: float = OSORT_FS_HZ,
     for downstream WaveMAP quality gating.
 
     If return_waveforms=True, returns (df, waveforms) where `waveforms` is a list of
-    polarity-normalized 1-D mean waveforms (native length) in the same row order as df
-    (None for units without a valid waveform) — feed these straight into WaveMAP.
+    1-D mean waveforms (native length) in the same row order as df (None for units
+    without a valid waveform). waveform_kind="normalized" (default) returns polarity-
+    normalized (trough-down) waveforms ready for WaveMAP; waveform_kind="raw" returns
+    the un-flipped mean waveform so a notebook can show the align/normalize steps itself.
+
+    If return_spike_times=True, also returns a list of full-session spike-time arrays
+    (seconds) in df row order — the ACG line needs these and gets them through the same
+    area-filter/unit_id path (no second NWB pass, guaranteed alignment). Return shape:
+        return_waveforms & return_spike_times -> (df, waveforms, spike_times)
+        return_spike_times only               -> (df, spike_times)
+        return_waveforms only                 -> (df, waveforms)
+        neither                                -> df
+
+    areas : optional str or list of str. Keep only units whose electrode `location`
+        contains one of these (case-insensitive substring), e.g. ["hippocampus"] or
+        ["amygdala", "hippocampus"]. None/empty = all areas. Filtered at read time, so
+        out-of-area units cost no waveform/ACG compute (df + waveforms stay aligned).
     """
+    area_pats = None
+    if areas:
+        area_list = [areas] if isinstance(areas, str) else list(areas)
+        area_pats = [str(a).lower() for a in area_list if str(a).strip()] or None
     rows = []
     waveforms_out = []
+    spike_times_out = []
     for fp in nwb_files:
         fp = Path(fp)
         sid = fp.stem
@@ -266,8 +298,12 @@ def build_unit_features(nwb_files, fs_hz: float = OSORT_FS_HZ,
         qc_cols = [c for c in ("waveforms_mean_snr", "waveforms_peak_snr",
                                "waveforms_isolation_distance", "clusterID_orig") if c in udf.columns]
         n_valid = 0
+        n_kept = 0
         for i in range(len(udf)):
             loc = _unit_location(i, udf, edf)
+            if area_pats is not None and not any(p in (loc or "").lower() for p in area_pats):
+                continue
+            n_kept += 1
             m_wf, n_spk_wf, n_ch = mean_waveform(udf.iloc[i][wf_col]) if wf_col else (None, 0, 0)
             wf_feat = waveform_shape_features(m_wf, fs_hz=fs_hz)
             st = np.asarray(nwb.units["spike_times"][i][:], dtype=float)
@@ -280,12 +316,23 @@ def build_unit_features(nwb_files, fs_hz: float = OSORT_FS_HZ,
                 row[c] = udf.iloc[i][c]
             rows.append(row)
             if return_waveforms:
-                norm_wf, _ = polarity_normalized_waveform(m_wf)
-                waveforms_out.append(norm_wf)
+                if waveform_kind == "raw":
+                    waveforms_out.append(np.asarray(m_wf, dtype=float).ravel()
+                                         if m_wf is not None else None)
+                else:
+                    norm_wf, _ = polarity_normalized_waveform(m_wf)
+                    waveforms_out.append(norm_wf)
+            if return_spike_times:
+                spike_times_out.append(st)
         io.close()
         if verbose:
-            print(f"  {sid}: {len(udf)} units ({n_valid} valid waveforms), wf_col={wf_col}")
+            kept_str = f"{n_kept}/{len(udf)}" if area_pats is not None else f"{len(udf)}"
+            print(f"  {sid}: {kept_str} units ({n_valid} valid waveforms), wf_col={wf_col}")
     df = pd.DataFrame(rows)
+    if return_waveforms and return_spike_times:
+        return df, waveforms_out, spike_times_out
+    if return_spike_times:
+        return df, spike_times_out
     if return_waveforms:
         return df, waveforms_out
     return df

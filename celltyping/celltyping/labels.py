@@ -34,7 +34,8 @@ LABEL_COLS = ["unit_id", "session_id", "subject", "location",
 
 
 def build_label_table(nwb_files, fs_hz: float = OSORT_FS_HZ, dataset: str | None = None,
-                      do_wavemap: bool = True, min_peak_snr: float | None = None,
+                      do_wavemap: bool = True, areas=None,
+                      min_peak_snr: float | None = None,
                       max_isi_viol: float | None = 0.05,
                       preprocess_kwargs: dict | None = None,
                       wavemap_kwargs: dict | None = None,
@@ -46,12 +47,16 @@ def build_label_table(nwb_files, fs_hz: float = OSORT_FS_HZ, dataset: str | None
     min_peak_snr, max_isi_viol : QC gates for `qc_pass` (and WaveMAP inclusion).
         Defaults are lenient; tighten to WaveMAP's SNR>=3 / ISI-viol<0.0025 if desired.
     do_wavemap : run WaveMAP on the QC-passing units and add `wavemap_cluster`.
+    areas : optional str or list of str. Restrict to units whose electrode `location`
+        contains one of these (case-insensitive substring), e.g. ["hippocampus"].
+        None/empty = all areas.
     dataset : optional tag stored in a `dataset` column (use when pooling 000673+000469).
 
     Returns (label_df, extras) where extras holds the full feature frame, the
     narrow/broad split (ms), and the WaveMAP result dict (embedding/graph/reducer) if run.
     """
-    df, wfs = build_unit_features(nwb_files, fs_hz=fs_hz, return_waveforms=True, verbose=verbose)
+    df, wfs = build_unit_features(nwb_files, fs_hz=fs_hz, areas=areas,
+                                  return_waveforms=True, verbose=verbose)
     if dataset is not None:
         df.insert(1, "dataset", dataset)
 
@@ -99,10 +104,15 @@ def build_label_table(nwb_files, fs_hz: float = OSORT_FS_HZ, dataset: str | None
 
 
 def attach_labels(analysis_df, label_df, on: str = "unit_id",
-                  cols=("wf_group", "wavemap_cluster", "putative_type", "qc_pass")):
+                  cols=("wf_group", "wavemap_cluster", "cluster_id", "wavemap_type",
+                        "acg_cluster", "acg_type", "putative_type", "qc_pass")):
     """Left-join cell-type labels onto any trial/unit analysis frame keyed by unit_id.
 
-    Lets a 'normal' downstream WM analysis group by wf_group / wavemap_cluster.
+    Lets a 'normal' downstream WM analysis group by wf_group / wavemap_cluster / wavemap_type.
+    Subset a cluster later with, e.g.,
+        ids = labs.loc[labs.wavemap_type == "fast-spiking (putative interneuron)", "unit_id"]
+        sub = analysis_df[analysis_df.unit_id.isin(ids)]
+    Only columns present in label_df are joined (missing ones are silently skipped).
     """
     take = [on] + [c for c in cols if c in label_df.columns]
     return analysis_df.merge(label_df[take], on=on, how="left")

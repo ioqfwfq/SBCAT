@@ -4,6 +4,7 @@ Run from E:\\SBCAT with the project venv, e.g.:
     .venv\\Scripts\\python.exe celltyping\\build_labels.py --dataset 000673
     .venv\\Scripts\\python.exe celltyping\\build_labels.py --dataset 000469 --no-wavemap
     .venv\\Scripts\\python.exe celltyping\\build_labels.py --dataset both
+    .venv\\Scripts\\python.exe celltyping\\build_labels.py --dataset 000673 --area hippocampus amygdala
 
 Writes outputs/celltype/unit_labels_<dataset>.csv and, per dataset, a QC figure.
 Nothing here is auto-run — execute + debug at your own pace.
@@ -29,15 +30,16 @@ DATASETS = {
 }
 
 
-def run_one(name: str, do_wavemap: bool, out_dir: Path):
+def run_one(name: str, do_wavemap: bool, out_dir: Path, areas=None):
     cfg = DATASETS[name]
     files = sorted(Path(cfg["root"]).glob(cfg["glob"]))
     if not files:
         print(f"[{name}] no NWB files under {cfg['root']} (downloaded yet?) — skipping")
         return None
-    print(f"[{name}] {len(files)} files")
+    print(f"[{name}] {len(files)} files" + (f" | areas={areas}" if areas else ""))
     label_df, extras = build_label_table(
-        files, fs_hz=cfg["fs_hz"], dataset=name, do_wavemap=do_wavemap, verbose=True)
+        files, fs_hz=cfg["fs_hz"], dataset=name, do_wavemap=do_wavemap,
+        areas=areas, verbose=True)
 
     csv = out_dir / f"unit_labels_{name}.csv"
     save_label_table(label_df, csv)
@@ -63,6 +65,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="000673", choices=["000673", "000469", "both"])
     ap.add_argument("--no-wavemap", action="store_true", help="skip WaveMAP clustering")
+    ap.add_argument("--area", nargs="+", default=None,
+                    help="keep only units whose electrode location contains one of these "
+                         "(case-insensitive substring), e.g. --area hippocampus amygdala")
     ap.add_argument("--out", default=str(ROOT / "outputs" / "celltype"))
     args = ap.parse_args()
 
@@ -70,7 +75,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     names = ["000673", "000469"] if args.dataset == "both" else [args.dataset]
     for name in names:
-        run_one(name, do_wavemap=not args.no_wavemap, out_dir=out_dir)
+        run_one(name, do_wavemap=not args.no_wavemap, out_dir=out_dir, areas=args.area)
 
 
 if __name__ == "__main__":

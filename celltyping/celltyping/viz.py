@@ -110,3 +110,75 @@ def plot_wavemap_embedding(embedding, feat_df=None, labels=None, color_by="wavem
         ax.set_ylabel("UMAP-2")
     fig.tight_layout()
     return fig
+
+
+def plot_waveform_grid(waveforms, unit_ids=None, order=None, ncols=10,
+                       excluded=None, suspicion=None, title=None, max_plots=200):
+    """Grid of individual mean waveforms for visual curation / inspection.
+
+    waveforms : list of 1-D arrays (None entries skipped).
+    order     : optional iterable of positions to draw first (e.g. worst-first).
+    excluded  : optional set/list of positions or unit_ids to draw in red (to be culled).
+    suspicion : optional per-position score printed under each waveform.
+    """
+    idx = list(order) if order is not None else list(range(len(waveforms)))
+    idx = [i for i in idx if waveforms[i] is not None]
+    if max_plots is not None:
+        idx = idx[:max_plots]
+    n = len(idx)
+    if n == 0:
+        fig, ax = plt.subplots()
+        ax.set_title("no waveforms to show")
+        return fig
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 1.3, nrows * 1.2), squeeze=False)
+    exc = set(excluded) if excluded is not None else set()
+    for k, i in enumerate(idx):
+        ax = axes[k // ncols][k % ncols]
+        w = np.asarray(waveforms[i], dtype=float).ravel()
+        uid = unit_ids[i] if unit_ids is not None else i
+        is_exc = (i in exc) or (uid in exc)
+        ax.plot(w, lw=0.8, color="#d62728" if is_exc else "#333")
+        lab = str(uid).split("_ses")[0].replace("sub-", "") if unit_ids is not None else str(i)
+        if suspicion is not None:
+            lab += f"\n{suspicion[i]:.2g}"
+        ax.set_title(lab, fontsize=5)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    for k in range(n, nrows * ncols):
+        axes[k // ncols][k % ncols].set_visible(False)
+    if title:
+        fig.suptitle(title, fontweight="bold", fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def plot_umap_colored(embedding, values, categorical=True, title=None, ax=None,
+                      cmap="tab20", max_legend=15):
+    """Recolor a UMAP embedding by an arbitrary per-unit value (batch-effect check).
+
+    Protocol step 18: color by subject/session/region and look for segregation. With more
+    than `max_legend` categorical levels the legend is suppressed (colors only). Continuous
+    values (categorical=False) get a colorbar.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(5.2, 4.4))
+    E = np.asarray(embedding)
+    v = np.asarray(values)
+    if categorical:
+        levels = list(np.unique(v.astype(str)))
+        cols = plt.get_cmap(cmap, max(len(levels), 1))
+        for j, lev in enumerate(levels):
+            m = v.astype(str) == lev
+            ax.scatter(E[m, 0], E[m, 1], s=10, alpha=0.7, color=cols(j),
+                       label=lev if len(levels) <= max_legend else None)
+        if len(levels) <= max_legend:
+            ax.legend(fontsize=6, markerscale=1.3, loc="best")
+    else:
+        sc = ax.scatter(E[:, 0], E[:, 1], s=10, c=v.astype(float), cmap="viridis")
+        ax.figure.colorbar(sc, ax=ax)
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    if title:
+        ax.set_title(title, fontsize=10)
+    return ax.figure

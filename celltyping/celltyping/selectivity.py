@@ -160,6 +160,33 @@ def trial_onsets_categories(trials_df, keep=(1, 2, 3, 4, 5)):
     return on[ok], cat[ok].astype(int)
 
 
+def pooled_presentations(trials_df, keep=(1, 2, 3, 4, 5), include_probe: bool = True):
+    """All picture presentations in a session -> (onsets_s, category_ids), pooled.
+
+    Stacks every encoding stimulus (Encoding1/2/3) and, if `include_probe`, the Probe, each
+    labelled by its OWN picture category (PicID // 100). Absent presentations (e.g. Encoding2/3
+    in load-1 trials) and out-of-`keep` categories are dropped. This is the observation set for
+    the paper's category-cell selection (200-1000 ms after every stimulus onset).
+    """
+    cols = [("timestamps_Encoding1", "PicIDs_Encoding1"),
+            ("timestamps_Encoding2", "PicIDs_Encoding2"),
+            ("timestamps_Encoding3", "PicIDs_Encoding3")]
+    if include_probe:
+        cols.append(("timestamps_Probe", "PicIDs_Probe"))
+    ons, cats = [], []
+    for tcol, pcol in cols:
+        if trials_df is None or tcol not in trials_df or pcol not in trials_df:
+            continue
+        on = pd.to_numeric(trials_df[tcol], errors="coerce").to_numpy(dtype=float)
+        pic = pd.to_numeric(trials_df[pcol], errors="coerce").to_numpy(dtype=float)
+        cat = np.where(pic >= 100, pic // 100, pic)
+        ok = np.isfinite(on) & (on > 0) & np.isfinite(cat) & np.isin(cat, keep)
+        ons.append(on[ok]); cats.append(cat[ok].astype(int))
+    if not ons:
+        return np.array([]), np.array([])
+    return np.concatenate(ons), np.concatenate(cats)
+
+
 # ── spike counting / selectivity ─────────────────────────────────────────────
 def window_counts(spike_times, onsets, t0: float, t1: float) -> np.ndarray:
     """Spike count in [onset+t0, onset+t1] per trial (searchsorted, O(trials log n))."""

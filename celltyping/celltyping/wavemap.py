@@ -4,7 +4,8 @@ Faithful reimplementation of Lee et al. 2021 (eLife) / the STAR-Protocols recipe
     1. preprocess   align each mean waveform to its trough, crop a common window,
                     mean-subtract, normalize each waveform to max |amplitude| = 1
     2. UMAP         build the fuzzy-simplicial graph (n_neighbors=15)
-    3. Louvain      community-detect on that graph (resolution=2) -> cluster labels
+    3. Louvain      community-detect on that graph -> cluster labels (resolution chosen
+                    per-dataset by sweep; see the convention warning in run_wavemap)
     4. interpret    XGBoost waveform->cluster classifier + TreeSHAP feature importance
 
 Notes
@@ -18,6 +19,9 @@ Notes
   verify no dataset-driven splitting before pooling. `dataset` labels can be passed to
   `check_dataset_confound` for that check.
 * ~300 high-quality units are recommended for stable results.
+* The Louvain `resolution` here is python-louvain's, NOT the protocol's cylouvain: higher
+  -> MORE clusters, the reverse of what the paper's text says. The paper's value of 2 is
+  therefore not portable; derive it with resolution_sweep(). See run_wavemap's docstring.
 """
 
 from __future__ import annotations
@@ -102,7 +106,21 @@ def run_wavemap(X, n_neighbors: int = 15, min_dist: float = 0.1, metric: str = "
     """UMAP fuzzy graph + Louvain community detection (the WaveMAP core).
 
     Returns dict(labels, embedding, graph, reducer). `labels` are 0-based cluster ids
-    aligned to X rows. `resolution` up -> fewer clusters (protocol default 2).
+    aligned to X rows.
+
+    RESOLUTION CONVENTION -- read before tuning. We use python-louvain (`community`),
+    where `resolution` multiplies the NULL-MODEL term in __one_level:
+        incr = remove_cost + dnc - resolution * degrees[com] * degc_totw
+    so higher resolution -> MORE, smaller clusters (standard Reichardt-Bornholdt gamma).
+    Verified empirically: on a UMAP fuzzy graph, r=0.5->3, r=1->3, r=2->7, r=3->16, r=5->31.
+
+    The STAR-Protocols paper uses a DIFFERENT package, `cylouvain`, and states the opposite
+    direction ("larger resolution results in fewer" clusters). Its default of 2 was tuned
+    under that convention and does NOT transfer here -- at resolution=2 this function
+    over-splits badly (856 units -> 21 clusters). cylouvain does not build on Python 3.13,
+    so the two cannot be compared directly. Do not inherit the number 2: choose `resolution`
+    from resolution_sweep() / tune_wavemap() on your own data, as the protocol itself
+    sanctions ("this can be changed by the user").
     """
     import umap
     import networkx as nx
@@ -175,7 +193,7 @@ def check_dataset_confound(labels, dataset):
 
 
 # ── resolution selection (protocol Fig. 4: modularity vs number of clusters) ──
-def resolution_sweep(X, resolutions=(1.0, 1.5, 2.0, 2.5, 3.0),
+def resolution_sweep(X, resolutions=(0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0),
                      n_neighbors: int = 15, min_dist: float = 0.1,
                      metric: str = "euclidean", random_state: int = 42):
     """Sweep Louvain resolution on ONE UMAP graph -> DataFrame(resolution, n_clusters, modularity).
@@ -183,6 +201,11 @@ def resolution_sweep(X, resolutions=(1.0, 1.5, 2.0, 2.5, 3.0),
     The protocol chooses `resolution` by jointly maximizing modularity while minimizing
     the number of clusters (Lee et al. 2021, Fig. 4). UMAP is fit once; only Louvain re-runs,
     so this is cheap. Use it to justify the resolution passed to run_wavemap().
+
+    Grid runs DOWN from 3.0 because higher resolution -> MORE clusters in python-louvain
+    (see run_wavemap's convention warning); the few-cluster end of the sweep is below 1.0,
+    not above it. `modularity` is plain Newman modularity at gamma=1, so it is comparable
+    across rows.
     """
     import umap
     import networkx as nx
@@ -260,7 +283,7 @@ def label_clusters(profile, split_ms: float, rate_fs_hz: float = 5.0, burst_hi: 
 
 # ── parameter tuning: grid over (n_neighbors, resolution) scored on 3 axes ────
 def tune_wavemap(X, n_neighbors_grid=(15, 20, 30, 50),
-                 resolution_grid=(1.0, 1.5, 2.0, 2.5, 3.0), seeds=(1, 2, 3),
+                 resolution_grid=(0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0), seeds=(1, 2, 3),
                  feat_df=None, factor=None,
                  physio_feats=("trough_to_peak_ms", "half_width_ms", "peak_trough_ratio",
                                "repol_slope", "mean_rate_hz", "isi_cv", "burst_index"),

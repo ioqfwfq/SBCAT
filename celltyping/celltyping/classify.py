@@ -1,7 +1,16 @@
 """Narrow/broad waveform split + putative-interneuron verification.
 
 split: trough-to-peak duration, boundary from the GMM density antimode (the same
-rule as the WM-binding neural_01c pipeline), with 'median'/'fixed' fallbacks.
+rule as the WM-binding neural_01c pipeline), with 'kde'/'median'/'fixed' fallbacks.
+
+'antimode' fits a 2-component GMM, which fails when the narrow cluster is a small
+minority (<~10%) and the broad mass is wide: the mixture then splits the BROAD
+population in two, finds no valley between its component means, and silently falls
+back to their midpoint -- a boundary that cuts through the middle of the main mode.
+'kde' is the robust alternative: a kernel density estimate searched for its deepest
+local minimum inside a physiologically plausible window. Use kde_antimode_split()
+directly to get the diagnostics (valley depth, fallback flag) needed to tell a real
+valley from a fabricated one.
 
 verify: the physiology check the project calls for — narrow-spiking cells, if they
 are putative fast-spiking inhibitory interneurons, should (vs broad) fire faster,
@@ -15,12 +24,42 @@ import numpy as np
 import pandas as pd
 
 
+def kde_antimode_split(x, lo: float = 0.25, hi: float = 0.75, bw: float = 0.15) -> dict:
+    """Deepest KDE local minimum of `x` inside [lo, hi] -- the narrow/broad valley.
+
+    The search window brackets where the FS/pyramidal boundary can physiologically sit,
+    so a small narrow cluster cannot be outvoted by structure inside the broad mass.
+
+    Returns dict(split_ms, rel_depth, found). `rel_depth` is the valley density over the
+    window's peak density: ~0.2-0.3 is a well-separated valley, >0.5 is barely a dip and
+    means the split is weakly supported. found=False (split_ms = midpoint of the window)
+    when the density is monotonic inside the window -- treat that as "no split found",
+    not as a boundary.
+    """
+    from scipy.stats import gaussian_kde
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 20:
+        return dict(split_ms=float(0.5 * (lo + hi)), rel_depth=np.nan, found=False)
+    grid = np.linspace(lo, hi, 2001)
+    d = gaussian_kde(x, bw_method=bw)(grid)
+    interior = np.where((d[1:-1] < d[:-2]) & (d[1:-1] < d[2:]))[0] + 1
+    if interior.size == 0:
+        return dict(split_ms=float(0.5 * (lo + hi)), rel_depth=np.nan, found=False)
+    j = int(interior[np.argmin(d[interior])])
+    return dict(split_ms=float(grid[j]), rel_depth=float(d[j] / d.max()), found=True)
+
+
 def assign_narrow_broad(feat_df: pd.DataFrame, col: str = "trough_to_peak_ms",
                         method: str = "antimode", fixed_ms: float = 0.5,
-                        valid_col: str = "wf_valid", random_state: int = 0):
+                        valid_col: str = "wf_valid", random_state: int = 0,
+                        kde_window: tuple = (0.25, 0.75), kde_bw: float = 0.15):
     """Return (group Series aligned to feat_df.index, split_ms).
 
     narrow = col < split_ms, broad = col >= split_ms; pd.NA where invalid.
+
+    method: 'antimode' (2-component GMM valley) | 'kde' (KDE valley in kde_window,
+    robust to a small narrow minority) | 'median' | 'fixed'.
     """
     valid = feat_df.get(valid_col, pd.Series(True, index=feat_df.index)).fillna(False).astype(bool)
     x_all = pd.to_numeric(feat_df[col], errors="coerce")
@@ -33,6 +72,9 @@ def assign_narrow_broad(feat_df: pd.DataFrame, col: str = "trough_to_peak_ms",
         split_ms = float(fixed_ms)
     elif method == "median":
         split_ms = float(np.median(x))
+    elif method == "kde":
+        res = kde_antimode_split(x, lo=kde_window[0], hi=kde_window[1], bw=kde_bw)
+        split_ms = res["split_ms"] if res["found"] else float(fixed_ms)
     elif method == "antimode":
         from sklearn.mixture import GaussianMixture
         gm = GaussianMixture(2, random_state=random_state).fit(x.reshape(-1, 1))
